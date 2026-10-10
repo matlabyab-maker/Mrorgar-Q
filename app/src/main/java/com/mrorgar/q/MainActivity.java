@@ -21,6 +21,7 @@ import android.os.Environment;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
+import android.view.MotionEvent;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -40,10 +41,12 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Switch;
 import android.widget.Toast;
 
 import org.json.JSONTokener;
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -56,6 +59,7 @@ public class MainActivity extends Activity {
     private LinearLayout root, top, tabStrip, tabRow, addressRow;
     private FrameLayout stage;
     private Button restoreButton;
+    private Button bookmarkButton;
     private Button copyMwButton;
     private boolean copyMwArmed = false;
     private ValueCallback<Uri[]> uploadCallback;
@@ -67,6 +71,9 @@ public class MainActivity extends Activity {
     private static final int DNS_VPN_REQUEST = 605;
     private boolean fullscreen = false;
     private boolean desktopMode = false;
+    private float restoreTouchDownX, restoreTouchDownY;
+    private int restoreStartLeft, restoreStartTop;
+    private boolean restoreMoved = false;
     private final List<BrowserTab> tabs = new ArrayList<>();
     private int activeTabIndex = -1;
     private byte[] pendingSaveBytes;
@@ -91,10 +98,10 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
         downloadManager = (DownloadManager)getSystemService(DOWNLOAD_SERVICE);
         buildUI();
-        String initialUrl = "https://www.google.com";
+        String initialUrl = "mrorgar://home";
         if (state != null) {
             String savedUrl = state.getString("current_url");
-            if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl;
+            if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl.startsWith("https://mrorgar.home/") ? "mrorgar://home" : savedUrl;
             desktopMode = state.getBoolean("desktop_mode", false);
         } else desktopMode = prefs().getBoolean("desktop_mode", false);
         createTab(initialUrl);
@@ -140,34 +147,128 @@ public class MainActivity extends Activity {
         int colorIndex = 0;
         for (String name : names) {
             Button b = makeButton(name,9f);
-            b.setPadding(dp(1),0,dp(1),0);
+            b.setPadding(0,0,0,0);
+            // Use a drawable without the stock Button's wide built-in insets, so the gaps shrink.
+            b.setBackground(new android.graphics.drawable.GradientDrawable());
             b.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(buttonColors[colorIndex][0],buttonColors[colorIndex][1],buttonColors[colorIndex][2])));
-            // All top-row buttons use exactly the same width and height.
-            top.addView(b,new LinearLayout.LayoutParams(0,dp(59),1f));
+            // Equal width/height for every top-row button, with minimal visual gaps.
+            LinearLayout.LayoutParams buttonLp = new LinearLayout.LayoutParams(0,dp(59),1f);
+            buttonLp.setMargins(dp(1),0,dp(1),0);
+            top.addView(b,buttonLp);
             if ("Copy MW".equals(name)) copyMwButton = b;
             b.setOnClickListener(v -> { if ("Android Desktop".equals(name)) toggleDesktopMode(); else if ("Save".equals(name)) multiDownloadDialog(); else doAction(name); });
+            enableTwoSecondDragReorder(b, top);
             colorIndex++;
         }
         root.addView(top,new LinearLayout.LayoutParams(-1,dp(59)));
         addressRow = new LinearLayout(this); addressRow.setOrientation(LinearLayout.HORIZONTAL); addressRow.setGravity(Gravity.CENTER_VERTICAL); addressRow.setPadding(dp(3),0,dp(3),0);
         address = new EditText(this); address.setSingleLine(true); address.setTextSize(14); address.setHint("Website or search words"); address.setPadding(dp(10),0,dp(8),0); address.setImeOptions(EditorInfo.IME_ACTION_GO); address.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);
         addressRow.addView(address,new LinearLayout.LayoutParams(0,dp(42),1));
+        bookmarkButton = new Button(this); bookmarkButton.setText("☆"); bookmarkButton.setTextSize(23); bookmarkButton.setAllCaps(false); bookmarkButton.setPadding(0,0,0,0); bookmarkButton.setMinWidth(0); bookmarkButton.setMinimumWidth(0); bookmarkButton.setTextColor(Color.rgb(90,90,90)); bookmarkButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(232,234,237)));
+        addressRow.addView(bookmarkButton,new LinearLayout.LayoutParams(dp(42),dp(42)));
+        bookmarkButton.setOnClickListener(v -> toggleBookmark());
+        bookmarkButton.setOnLongClickListener(v -> { showBookmarks(); return true; });
         Button go = makeButton("Go",10); go.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(232,234,237))); go.setTextColor(Color.BLACK);
         addressRow.addView(go,new LinearLayout.LayoutParams(dp(48),dp(42))); go.setOnClickListener(v -> loadAddress());
+        Button home = makeButton("خانه",10); home.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(0,121,107))); home.setTextColor(Color.WHITE);
+        addressRow.addView(home,new LinearLayout.LayoutParams(dp(48),dp(42))); home.setOnClickListener(v -> { if (web != null) loadHomePage(web); });
         root.addView(addressRow,new LinearLayout.LayoutParams(-1,dp(42)));
         tabRow = new LinearLayout(this); tabRow.setOrientation(LinearLayout.HORIZONTAL); tabRow.setGravity(Gravity.CENTER_VERTICAL); tabRow.setBackgroundColor(Color.rgb(238,239,241));
+        // These two navigation buttons are fixed: they are deliberately not attached to the drag/reorder handler.
+        Button history = makeButton("History",9f); history.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(69,90,100)));
+        tabRow.addView(history,new LinearLayout.LayoutParams(dp(62),dp(34))); history.setOnClickListener(v -> showHistory());
+        Button favorites = makeButton("Favorites",9f); favorites.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(230,126,34)));
+        tabRow.addView(favorites,new LinearLayout.LayoutParams(dp(72),dp(34))); favorites.setOnClickListener(v -> showBookmarks());
         HorizontalScrollView scroll = new HorizontalScrollView(this); scroll.setHorizontalScrollBarEnabled(false);
         tabStrip = new LinearLayout(this); tabStrip.setOrientation(LinearLayout.HORIZONTAL); scroll.addView(tabStrip,new HorizontalScrollView.LayoutParams(-2,-1));
         tabRow.addView(scroll,new LinearLayout.LayoutParams(0,dp(36),1));
         Button add = new Button(this); add.setText("+"); add.setTextSize(20); add.setAllCaps(false); add.setPadding(0,0,0,0); add.setMinWidth(0); add.setMinimumWidth(0);
-        tabRow.addView(add,new LinearLayout.LayoutParams(dp(44),dp(36))); add.setOnClickListener(v -> createTab("https://www.google.com"));
+        tabRow.addView(add,new LinearLayout.LayoutParams(dp(38),dp(36))); add.setOnClickListener(v -> createTab("https://www.google.com"));
         root.addView(tabRow,new LinearLayout.LayoutParams(-1,dp(36)));
         stage = new FrameLayout(this); root.addView(stage,new LinearLayout.LayoutParams(-1,0,1));
-        restoreButton = new Button(this); restoreButton.setText("↗"); restoreButton.setTextSize(18); restoreButton.setAllCaps(false); restoreButton.setVisibility(View.GONE); restoreButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(255,213,79))); restoreButton.setTextColor(Color.BLACK);
-        stage.addView(restoreButton,new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.RIGHT|Gravity.CENTER_VERTICAL));
-        restoreButton.setOnClickListener(v -> { if (fullscreen) setFullscreen(); });
+        restoreButton = new Button(this); restoreButton.setText("↗"); restoreButton.setTextSize(18); restoreButton.setAllCaps(false); restoreButton.setVisibility(View.GONE); restoreButton.setTextColor(Color.WHITE);
+        restoreButton.setBackgroundTintList(ColorStateList.valueOf(Color.TRANSPARENT)); restoreButton.setBackgroundColor(Color.TRANSPARENT); restoreButton.setAlpha(0.48f); restoreButton.setElevation(dp(5)); restoreButton.setPadding(0,0,0,0);
+        FrameLayout.LayoutParams restoreLp = new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.LEFT); restoreLp.leftMargin=dp(8); restoreLp.topMargin=dp(90);
+        stage.addView(restoreButton,restoreLp);
+        restoreButton.setOnTouchListener((v,event)->{
+            FrameLayout.LayoutParams lp=(FrameLayout.LayoutParams)restoreButton.getLayoutParams();
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN: restoreTouchDownX=event.getRawX(); restoreTouchDownY=event.getRawY(); restoreStartLeft=lp.leftMargin; restoreStartTop=lp.topMargin; restoreMoved=false; return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx=event.getRawX()-restoreTouchDownX,dy=event.getRawY()-restoreTouchDownY;
+                    if(Math.abs(dx)>dp(4)||Math.abs(dy)>dp(4))restoreMoved=true;
+                    if(restoreMoved){int maxX=Math.max(0,stage.getWidth()-restoreButton.getWidth());int maxY=Math.max(0,stage.getHeight()-restoreButton.getHeight());lp.gravity=Gravity.TOP|Gravity.LEFT;lp.leftMargin=Math.max(0,Math.min(maxX,restoreStartLeft+(int)dx));lp.topMargin=Math.max(0,Math.min(maxY,restoreStartTop+(int)dy));restoreButton.setLayoutParams(lp);} return true;
+                case MotionEvent.ACTION_UP: if(!restoreMoved&&fullscreen)setFullscreen(); v.performClick(); return true;
+                case MotionEvent.ACTION_CANCEL:return true;
+            } return true;
+        });
         setContentView(root);
         address.setOnEditorActionListener((v,id,event) -> { if (id==EditorInfo.IME_ACTION_GO||id==EditorInfo.IME_ACTION_DONE||id==EditorInfo.IME_ACTION_SEARCH) { loadAddress(); return true; } return false; });
+    }
+
+
+    // Hold a toolbar button for two seconds, then drag horizontally to reorder it.
+    // A short tap still triggers the button's original action.
+    private void enableTwoSecondDragReorder(Button button, LinearLayout parent) {
+        final boolean[] armed = {false};
+        final boolean[] dragging = {false};
+        final float[] downRawX = {0f};
+        final float[] downRawY = {0f};
+        final int[] originalIndex = {-1};
+        final Runnable armDrag = () -> {
+            armed[0] = true;
+            Toast.makeText(MainActivity.this, "دکمه آمادهٔ جابه‌جایی است؛ آن را بکشید", Toast.LENGTH_SHORT).show();
+        };
+        button.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    armed[0] = false;
+                    dragging[0] = false;
+                    downRawX[0] = event.getRawX();
+                    downRawY[0] = event.getRawY();
+                    originalIndex[0] = parent.indexOfChild(button);
+                    button.postDelayed(armDrag, 2000L);
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx = event.getRawX() - downRawX[0];
+                    float dy = event.getRawY() - downRawY[0];
+                    if (armed[0] && (Math.abs(dx) > dp(5) || Math.abs(dy) > dp(5))) {
+                        dragging[0] = true;
+                        button.setAlpha(0.72f);
+                        button.setElevation(dp(8));
+                        float x = event.getRawX();
+                        int target = parent.getChildCount() - 1;
+                        for (int i = 0; i < parent.getChildCount(); i++) {
+                            View child = parent.getChildAt(i);
+                            int[] loc = new int[2]; child.getLocationOnScreen(loc);
+                            if (x < loc[0] + child.getWidth() / 2f) { target = i; break; }
+                        }
+                        int current = parent.indexOfChild(button);
+                        if (target != current && target >= 0) {
+                            android.view.ViewGroup.LayoutParams lp = button.getLayoutParams();
+                            parent.removeView(button);
+                            parent.addView(button, Math.min(target, parent.getChildCount()), lp);
+                        }
+                        return true;
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    button.removeCallbacks(armDrag);
+                    button.setAlpha(1f);
+                    button.setElevation(0f);
+                    if (dragging[0]) {
+                        dragging[0] = false;
+                        armed[0] = false;
+                        return true;
+                    }
+                    boolean heldLongEnough = armed[0];
+                    armed[0] = false;
+                    if (event.getActionMasked() == MotionEvent.ACTION_UP) button.performClick();
+                    return true;
+            }
+            return true;
+        });
     }
 
     private void createTab(String url) {
@@ -175,7 +276,8 @@ public class MainActivity extends Activity {
         stage.addView(view,0,new FrameLayout.LayoutParams(-1,-1));
         LinearLayout chip = new LinearLayout(this); chip.setOrientation(LinearLayout.HORIZONTAL); chip.setGravity(Gravity.CENTER_VERTICAL); chip.setPadding(dp(3),0,dp(2),0); tab.chip = chip;
         Button select = makeButton("Tab "+tabs.size(),10); select.setTextColor(Color.BLACK); select.setBackgroundTintList(ColorStateList.valueOf(Color.WHITE)); tab.selectButton=select;
-        chip.addView(select,new LinearLayout.LayoutParams(-2,dp(32))); select.setOnClickListener(v -> selectTab(tabs.indexOf(tab)));
+        chip.addView(select,new LinearLayout.LayoutParams(-2,dp(32)));
+        enableTabDrag(select, tab);
         Button close = new Button(this); close.setText("×"); close.setTextSize(15); close.setAllCaps(false); close.setPadding(0,0,0,0); close.setMinWidth(0); close.setMinimumWidth(0); close.setMinHeight(0); close.setMinimumHeight(0); tab.closeButton=close;
         chip.addView(close,new LinearLayout.LayoutParams(dp(27),dp(32))); close.setOnClickListener(v -> closeTab(tabs.indexOf(tab)));
         tabStrip.addView(chip,new LinearLayout.LayoutParams(-2,dp(36)));
@@ -186,29 +288,104 @@ public class MainActivity extends Activity {
             }
             return false;
         });
-        selectTab(tabs.size()-1); view.loadUrl(url);
+        selectTab(tabs.size()-1); if ("mrorgar://home".equals(url)) loadHomePage(view); else view.loadUrl(url);
     }
+
+    // Hold a tab title briefly, then drag it horizontally to reorder tabs.
+    // A normal tap still selects the tab; the close button remains independent.
+    private void enableTabDrag(Button select, BrowserTab tab) {
+        final boolean[] armed = {false};
+        final boolean[] dragging = {false};
+        final float[] downX = {0f};
+        final float[] downY = {0f};
+        final Runnable arm = () -> {
+            armed[0] = true;
+            Toast.makeText(MainActivity.this, "زبانه آمادهٔ جابه‌جایی است؛ آن را بکشید", Toast.LENGTH_SHORT).show();
+        };
+        select.setOnTouchListener((v, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                armed[0] = false;
+                dragging[0] = false;
+                downX[0] = event.getRawX();
+                downY[0] = event.getRawY();
+                select.postDelayed(arm, 650L);
+                return true;
+            }
+            if (action == MotionEvent.ACTION_MOVE) {
+                float dx = event.getRawX() - downX[0];
+                float dy = event.getRawY() - downY[0];
+                if (armed[0] && (Math.abs(dx) > dp(5) || Math.abs(dy) > dp(5))) {
+                    dragging[0] = true;
+                    select.setAlpha(0.7f);
+                    select.setElevation(dp(5));
+                    float x = event.getRawX();
+                    int target = tabStrip.getChildCount() - 1;
+                    for (int i = 0; i < tabStrip.getChildCount(); i++) {
+                        View child = tabStrip.getChildAt(i);
+                        int[] location = new int[2];
+                        child.getLocationOnScreen(location);
+                        if (x < location[0] + child.getWidth() / 2f) { target = i; break; }
+                    }
+                    int current = tabStrip.indexOfChild(tab.chip);
+                    if (target >= 0 && target != current) {
+                        LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) tab.chip.getLayoutParams();
+                        tabStrip.removeView(tab.chip);
+                        tabStrip.addView(tab.chip, Math.min(target, tabStrip.getChildCount()), lp);
+                        // Keep the logical tab list in the same order as the visible strip.
+                        BrowserTab moved = tab;
+                        int oldListIndex = tabs.indexOf(moved);
+                        int newListIndex = Math.max(0, Math.min(target, tabs.size() - 1));
+                        if (oldListIndex >= 0 && oldListIndex != newListIndex) {
+                            tabs.remove(oldListIndex);
+                            tabs.add(Math.min(newListIndex, tabs.size()), moved);
+                        }
+                        activeTabIndex = indexOfWeb(web);
+                    }
+                    return true;
+                }
+                return true;
+            }
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                select.removeCallbacks(arm);
+                select.setAlpha(1f);
+                select.setElevation(0f);
+                if (dragging[0]) {
+                    dragging[0] = false;
+                    armed[0] = false;
+                    return true;
+                }
+                boolean wasArmed = armed[0];
+                armed[0] = false;
+                if (action == MotionEvent.ACTION_UP && !wasArmed) selectTab(tabs.indexOf(tab));
+                return true;
+            }
+            return true;
+        });
+    }
+
+    private int indexOfWeb(WebView view) { for (int i = 0; i < tabs.size(); i++) if (tabs.get(i).view == view) return i; return -1; }
 
     private void selectTab(int index) {
         if (index<0||index>=tabs.size()) return; activeTabIndex=index;
         for (int i=0;i<tabs.size();i++) { BrowserTab t=tabs.get(i); boolean selected=i==index; t.view.setVisibility(selected?View.VISIBLE:View.GONE); int c=selected?Color.WHITE:Color.rgb(218,220,224); t.chip.setBackgroundColor(c); t.selectButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.closeButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.selectButton.setText(t.title); }
-        web=tabs.get(index).view; String u=web.getUrl(); address.setText(u==null?"":u);
+        web=tabs.get(index).view; String u=web.getUrl(); address.setText(u==null?"":u); updateBookmarkButton(u);
     }
 
     private void closeTab(int index) {
         if (index<0||index>=tabs.size()) return;
-        if (tabs.size()==1) { BrowserTab t=tabs.get(0); t.view.stopLoading(); t.title="New tab"; t.selectButton.setText(t.title); t.view.loadUrl("https://www.google.com"); selectTab(0); return; }
+        if (tabs.size()==1) { BrowserTab t=tabs.get(0); t.view.stopLoading(); t.title="خانه"; t.selectButton.setText(t.title); loadHomePage(t.view); selectTab(0); return; }
         BrowserTab removed=tabs.remove(index); stage.removeView(removed.view); tabStrip.removeView(removed.chip); removed.view.stopLoading(); removed.view.destroy();
         if (index<activeTabIndex) activeTabIndex--; else if (index==activeTabIndex) activeTabIndex=Math.min(index,tabs.size()-1); selectTab(activeTabIndex);
     }
 
     private void configureWeb(WebView target) {
-        WebSettings s=target.getSettings(); s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false); s.setLoadsImagesAutomatically(true); s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
+        WebSettings s=target.getSettings(); s.setJavaScriptEnabled(prefs().getBoolean("javascript_enabled",true)); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportZoom(true); s.setBuiltInZoomControls(true); s.setDisplayZoomControls(false); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false); s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled",true)); s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
         CookieManager cm=CookieManager.getInstance(); cm.setAcceptCookie(true); if (Build.VERSION.SDK_INT>=21) cm.setAcceptThirdPartyCookies(target,true);
         target.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { String scheme=r.getUrl().getScheme(); return scheme!=null&&!scheme.equalsIgnoreCase("http")&&!scheme.equalsIgnoreCase("https"); }
             @Override public void onPageStarted(WebView v,String url,Bitmap icon) { updateTabInfo(target,url); }
-            @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); }
+            @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); if (url == null || !url.startsWith("https://mrorgar.home/")) addHistoryEntry(url); }
         });
         target.setWebChromeClient(new WebChromeClient() {
             @Override public void onReceivedTitle(WebView v,String title) { if (title==null||title.trim().isEmpty()) return; for (BrowserTab t:tabs) if (t.view==target) { t.title=title.length()>20?title.substring(0,20):title; t.selectButton.setText(t.title); break; } }
@@ -247,8 +424,79 @@ public class MainActivity extends Activity {
 
     private void updateTabInfo(WebView target,String url) {
         if (url==null) return;
-        for (BrowserTab t:tabs) if (t.view==target) { t.lastUrl=url; if (t.title.equals("New tab")||t.title.startsWith("Tab ")) { String host=Uri.parse(url).getHost(); if (host!=null&&!host.isEmpty()) t.title=host.length()>20?host.substring(0,20):host; } t.selectButton.setText(t.title); break; }
-        if (target==web) address.setText(url);
+        boolean homePage = url.startsWith("https://mrorgar.home/");
+        for (BrowserTab t:tabs) if (t.view==target) { t.lastUrl=url; if (homePage) t.title="خانه"; else if (t.title.equals("New tab")||t.title.startsWith("Tab ")||t.title.equals("خانه")) { String host=Uri.parse(url).getHost(); if (host!=null&&!host.isEmpty()) t.title=host.length()>20?host.substring(0,20):host; } t.selectButton.setText(t.title); break; }
+        if (target==web) { address.setText(homePage?"خانه | Mrorgar-Q":url); updateBookmarkButton(homePage?null:url); }
+    }
+
+    private void loadHomePage(WebView target) {
+        if (target == null) return;
+        String html = "<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>" +
+            "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=3'>" +
+            "<title>خانه | Mrorgar-Q</title><style>" +
+            "*{box-sizing:border-box}body{margin:0;background:#101820;color:#edf5f5;font-family:Arial,Tahoma,sans-serif}" +
+            ".wrap{max-width:1050px;margin:auto;padding:22px 15px 36px}.hero{padding:24px 18px;border-radius:20px;background:linear-gradient(135deg,#075e59,#183c5a);box-shadow:0 8px 28px #0005}" +
+            ".brand{font-size:27px;font-weight:800;margin:0 0 8px}.sub{color:#d0e5e6;font-size:14px;margin:0 0 18px}" +
+            ".search{display:flex;gap:8px}.search input{min-width:0;flex:1;padding:13px 14px;border:1px solid #ffffff30;border-radius:12px;background:#fff;color:#18232b;font-size:15px;outline:none}" +
+            ".search button{border:0;border-radius:12px;padding:0 17px;background:#f2c14e;color:#18232b;font-weight:bold;font-size:14px}" +
+            ".section{margin-top:25px}.section h2{font-size:18px;margin:0 0 12px;color:#f2c14e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px}" +
+            ".card{display:block;text-decoration:none;color:#edf5f5;background:#1b2a35;border:1px solid #ffffff13;border-radius:14px;padding:14px 12px;min-height:77px;transition:background .15s}" +
+            ".card:active{background:#294452}.emoji{font-size:22px;display:block;margin-bottom:7px}.name{font-size:14px;font-weight:bold}.desc{display:block;color:#a9c1c8;font-size:11px;margin-top:5px;direction:rtl}" +
+            ".footer{text-align:center;color:#91a9b1;font-size:11px;margin-top:28px}a{outline-offset:3px}" +
+            "</style></head><body><main class='wrap'><header class='hero'><h1 class='brand'>خانهٔ Mrorgar-Q</h1>" +
+            "<p class='sub'>دسترسی سریع به هوش مصنوعی، پیام‌رسان‌ها، تلویزیون و رادیوی آنلاین، دانشنامه و ابزارها</p>" +
+            "<form class='search' onsubmit='event.preventDefault();var q=document.getElementById(\"q\").value.trim();if(q)location.href=\"https://www.google.com/search?q=\"+encodeURIComponent(q)'>" +
+            "<input id='q' type='search' placeholder='جستجو در وب یا وارد کردن پرسش…' autocomplete='off'><button type='submit'>جستجو</button></form></header>" +
+            "<section class='section'><h2>هوش مصنوعی</h2><div class='grid'>" +
+            card("🤖","ChatGPT","هوش مصنوعی OpenAI","https://chatgpt.com/") +
+            card("✨","GapGPT","هوش مصنوعی","https://gapgpt.app/") +
+            card("🧠","هوشا","هوش مصنوعی فارسی","https://hoosha.com/") +
+            card("♊","Google Gemini","دستیار هوشمند","https://gemini.google.com/") +
+            card("🟣","Claude","دستیار هوشمند","https://claude.ai/") +
+            card("🔷","Microsoft Copilot","دستیار هوشمند","https://copilot.microsoft.com/") +
+            card("🌊","DeepSeek","گفت‌وگو و جست‌وجو","https://chat.deepseek.com/") +
+            "</div></section><section class='section'><h2>پیام‌رسان‌های ایرانی</h2><div class='grid'>" +
+            card("💬","روبیکا","پیام‌رسان و رسانه","https://rubika.ir/") +
+            card("🟠","بله","پیام‌رسان","https://ble.ir/") +
+            card("🟦","ایتا","پیام‌رسان","https://eitaa.com/") +
+            card("🟢","گپ","پیام‌رسان","https://gap.im/") +
+            card("📨","آی‌گپ","پیام‌رسان","https://igap.net/") +
+            card("🟣","سروش‌پلاس","پیام‌رسان","https://splus.ir/") +
+            "</div></section><section class='section'><h2>پیام‌رسان‌های جهانی</h2><div class='grid'>" +
+            card("✈️","Telegram","تلگرام وب","https://web.telegram.org/") +
+            card("🟩","WhatsApp","واتساپ وب","https://web.whatsapp.com/") +
+            card("🔵","Facebook Messenger","پیام‌رسان","https://www.messenger.com/") +
+            card("🟦","Discord","گفت‌وگو و انجمن‌ها","https://discord.com/app") +
+            card("🔒","Signal","پیام‌رسان امن","https://signal.org/") +
+            card("📷","Instagram","شبکه اجتماعی","https://www.instagram.com/") +
+            "</div></section><section class='section'><h2>تلویزیون و ویدئو</h2><div class='grid'>" +
+            card("▶️","YouTube","ویدئو و پخش زنده","https://www.youtube.com/") +
+            card("🌍","DW","خبر و پخش زنده","https://www.dw.com/") +
+            card("📺","France 24","خبر جهانی","https://www.france24.com/") +
+            card("📡","Al Jazeera","خبر و برنامه‌ها","https://www.aljazeera.com/") +
+            card("🎞️","Plex","تلویزیون اینترنتی","https://www.plex.tv/") +
+            card("📺","Pluto TV","تلویزیون آنلاین","https://pluto.tv/") +
+            "</div></section><section class='section'><h2>رادیوی جهانی</h2><div class='grid'>" +
+            card("🌐","Radio Garden","رادیوهای سراسر جهان","https://radio.garden/") +
+            card("🎧","TuneIn","رادیو، خبر و موسیقی","https://tunein.com/") +
+            card("📻","BBC Audio","رادیو و پادکست","https://www.bbc.com/audio") +
+            card("📰","VOA","صدای آمریکا","https://www.voanews.com/") +
+            card("🎵","NPR","رادیو و پادکست","https://www.npr.org/") +
+            "</div></section><section class='section'><h2>دانش، آرشیو و ابزارها</h2><div class='grid'>" +
+            card("📚","Wikipedia","دانشنامهٔ آزاد","https://www.wikipedia.org/") +
+            card("🗄️","Internet Archive","کتاب، رسانه و آرشیو وب","https://archive.org/") +
+            card("🕰️","Wayback Machine","نسخه‌های قدیمی سایت‌ها","https://web.archive.org/") +
+            card("🐙","GitHub","مخزن کد و پروژه‌ها","https://github.com/") +
+            card("🔎","Google","جست‌وجوی وب","https://www.google.com/") +
+            card("🦊","MDN Web Docs","راهنمای توسعه وب","https://developer.mozilla.org/") +
+            "</div></section><p class='footer'>برای باز کردن هر سرویس، کارت آن را لمس کنید. دسترسی به بعضی سایت‌ها ممکن است به شبکه یا حساب کاربری وابسته باشد.</p></main></body></html>";
+        target.loadDataWithBaseURL("https://mrorgar.home/", html, "text/html", "UTF-8", null);
+        for (BrowserTab t : tabs) if (t.view == target) { t.title = "خانه"; t.selectButton.setText(t.title); t.lastUrl = "https://mrorgar.home/"; break; }
+        if (target == web && address != null) address.setText("خانه | Mrorgar-Q");
+    }
+
+    private String card(String icon, String name, String description, String url) {
+        return "<a class='card' href='" + url + "'><span class='emoji'>" + icon + "</span><span class='name'>" + name + "</span><span class='desc'>" + description + "</span></a>";
     }
 
     private void loadAddress() {
@@ -299,12 +547,65 @@ public class MainActivity extends Activity {
         });
     }
 
+    // Prefer the server's real Content-Disposition filename, then the URL's actual path.
+    // The MIME type is used only to add a missing extension, not to replace an existing one.
+    private String resolveDownloadFileName(String url,String disposition,String mimeType) {
+        String candidate = null;
+        if (disposition != null && !disposition.trim().isEmpty()) {
+            String lower = disposition.toLowerCase(java.util.Locale.ROOT);
+            int star = lower.indexOf("filename*=");
+            if (star >= 0) {
+                String value = disposition.substring(star + 10).trim();
+                int semi = value.indexOf(';'); if (semi >= 0) value = value.substring(0, semi).trim();
+                if (value.startsWith("\"") && value.endsWith("\"") && value.length() >= 2) value = value.substring(1, value.length()-1);
+                int marker = value.indexOf("''"); if (marker >= 0) value = value.substring(marker + 2);
+                candidate = Uri.decode(value);
+            }
+            if (candidate == null || candidate.trim().isEmpty()) {
+                int at = lower.indexOf("filename=");
+                if (at >= 0) {
+                    String value = disposition.substring(at + 9).trim();
+                    int semi = value.indexOf(';'); if (semi >= 0) value = value.substring(0, semi).trim();
+                    if (value.startsWith("\"") && value.endsWith("\"") && value.length() >= 2) value = value.substring(1, value.length()-1);
+                    candidate = value;
+                }
+            }
+        }
+        if (candidate == null || candidate.trim().isEmpty()) {
+            try {
+                Uri uri = Uri.parse(url);
+                String path = uri.getLastPathSegment();
+                if (path != null && !path.trim().isEmpty()) candidate = Uri.decode(path);
+                if ((candidate == null || candidate.trim().isEmpty() || candidate.equalsIgnoreCase("download") || candidate.equalsIgnoreCase("file")) && uri.getQueryParameterNames() != null) {
+                    String[] keys = {"filename", "file", "name", "download"};
+                    for (String key : keys) { String value = uri.getQueryParameter(key); if (value != null && !value.trim().isEmpty()) { candidate = Uri.decode(value); break; } }
+                }
+            } catch (Exception ignored) { }
+        }
+        if (candidate == null || candidate.trim().isEmpty() || candidate.equals("/") || candidate.equalsIgnoreCase("index.php")) {
+            candidate = URLUtil.guessFileName(url, null, mimeType);
+        }
+        candidate = candidate == null ? "" : candidate.trim().replace('\\','/');
+        int slash = candidate.lastIndexOf('/'); if (slash >= 0) candidate = candidate.substring(slash + 1);
+        candidate = candidate.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
+        if (candidate.isEmpty() || candidate.equals(".") || candidate.equals("..")) candidate = URLUtil.guessFileName(url, disposition, mimeType);
+        if (candidate == null || candidate.trim().isEmpty()) {
+            String host = Uri.parse(url).getHost(); candidate = (host == null || host.isEmpty() ? "download" : host.replaceAll("[^A-Za-z0-9._-]", "_")) + "-download";
+        }
+        if (candidate.lastIndexOf('.') <= 0 && mimeType != null && !mimeType.trim().isEmpty()) {
+            String ext = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType.split(";")[0].trim());
+            if (ext != null && !ext.isEmpty()) candidate += "." + ext;
+        }
+        return candidate;
+    }
+
     private void enqueueDownload(String url,String userAgent,String disposition,String mimeType) {
         if (url==null||url.trim().isEmpty()) { toast("آدرس دانلود معتبر نیست"); return; }
         try {
             Uri uri=Uri.parse(url); String scheme=uri.getScheme();
             if (scheme==null||!(scheme.equalsIgnoreCase("http")||scheme.equalsIgnoreCase("https"))) { toast("این نوع آدرس برای دانلود پشتیبانی نمی‌شود"); return; }
-            String name=URLUtil.guessFileName(url,disposition,mimeType); DownloadManager.Request r=new DownloadManager.Request(uri); r.setTitle(name); r.setDescription("Mrorgar-Q Downloader"); r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED); r.setAllowedOverMetered(true); r.setAllowedOverRoaming(true);
+            String name=resolveDownloadFileName(url,disposition,mimeType);
+            DownloadManager.Request r=new DownloadManager.Request(uri); r.setTitle(name); r.setDescription("Mrorgar-Q Downloader"); r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED); r.setAllowedOverMetered(true); r.setAllowedOverRoaming(true);
             if (mimeType!=null&&!mimeType.trim().isEmpty()) r.setMimeType(mimeType); if (userAgent!=null&&!userAgent.trim().isEmpty()) r.addRequestHeader("User-Agent",userAgent); String cookie=CookieManager.getInstance().getCookie(url); if(cookie!=null&&!cookie.isEmpty())r.addRequestHeader("Cookie",cookie); r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,name); long id=downloadManager.enqueue(r); toast("دانلود شروع شد: "+name); showDownloadManager();
         } catch(Exception e) { toast("شروع دانلود ناموفق بود"); }
     }
@@ -423,14 +724,91 @@ public class MainActivity extends Activity {
     private EditText field(String hint,String value) { EditText e=new EditText(this);e.setSingleLine(true);e.setHint(hint);e.setTextSize(15);e.setPadding(dp(12),dp(8),dp(12),dp(8));if(value!=null){e.setText(value);e.setSelection(e.getText().length());}return e; }
 
     private void setupPanel() {
-        String message = "تنظیمات تکمیلی مرورگر\n\n"+
-                "دکمه‌های Back، Forward، Send، File، Copy MW، IP Set، Save، Android Desktop و F Screen روی نوار اصلی باقی می‌مانند.\n\n"+
-                "این بخش برای گزینه‌های کم‌استفادهٔ آینده در نظر گرفته شده است؛ فعلاً گزینهٔ تنظیمیِ دیگری به آن اضافه نشده تا دکمهٔ غیرعملیاتی نمایش داده نشود.";
-        new AlertDialog.Builder(this)
-                .setTitle("Setup")
-                .setMessage(message)
-                .setPositiveButton("باشه", null)
-                .show();
+        LinearLayout panel = new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL); panel.setPadding(dp(22),dp(8),dp(22),dp(4));
+        Switch js = new Switch(this); js.setText("JavaScript"); js.setTextSize(16); js.setPadding(0,dp(10),0,dp(10)); js.setChecked(prefs().getBoolean("javascript_enabled",true));
+        Switch photos = new Switch(this); photos.setText("Photo"); photos.setTextSize(16); photos.setPadding(0,dp(10),0,dp(10)); photos.setChecked(prefs().getBoolean("photos_enabled",true));
+        panel.addView(js,new LinearLayout.LayoutParams(-1,-2)); panel.addView(photos,new LinearLayout.LayoutParams(-1,-2));
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Setup — تنظیمات واقعی").setMessage("تغییر هر کلید ذخیره می‌شود و روی زبانه‌های مرورگر اعمال می‌شود.").setView(panel).setPositiveButton("بستن",null).create();
+        js.setOnCheckedChangeListener((button,checked)->{prefs().edit().putBoolean("javascript_enabled",checked).apply();applyWebPreferences();});
+        photos.setOnCheckedChangeListener((button,checked)->{prefs().edit().putBoolean("photos_enabled",checked).apply();applyWebPreferences();});
+        dialog.show();
+    }
+
+    private void applyWebPreferences() {
+        boolean js=prefs().getBoolean("javascript_enabled",true), photos=prefs().getBoolean("photos_enabled",true);
+        for(BrowserTab t:tabs){WebSettings settings=t.view.getSettings();settings.setJavaScriptEnabled(js);settings.setLoadsImagesAutomatically(photos);}
+        if(web!=null){web.reload();}
+        toast("تنظیمات ذخیره و اعمال شد");
+    }
+
+    private java.util.List<String> getHistoryEntries() {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        try {
+            JSONArray array = new JSONArray(prefs().getString("history_urls", "[]"));
+            for (int i = 0; i < array.length(); i++) {
+                String url = array.optString(i, "");
+                if (!url.isEmpty()) result.add(url);
+            }
+        } catch (Exception ignored) {}
+        return result;
+    }
+
+    private void addHistoryEntry(String url) {
+        if (url == null || url.trim().isEmpty() || "about:blank".equals(url)) return;
+        java.util.List<String> entries = getHistoryEntries();
+        // Keep the newest visit first and avoid consecutive duplicate entries.
+        if (!entries.isEmpty() && url.equals(entries.get(0))) return;
+        entries.remove(url);
+        entries.add(0, url);
+        while (entries.size() > 200) entries.remove(entries.size() - 1);
+        JSONArray array = new JSONArray();
+        for (String entry : entries) array.put(entry);
+        prefs().edit().putString("history_urls", array.toString()).apply();
+    }
+
+    private void showHistory() {
+        java.util.List<String> items = getHistoryEntries();
+        if (items.isEmpty()) { toast("تاریخچه خالی است"); return; }
+        String[] labels = items.toArray(new String[0]);
+        new AlertDialog.Builder(this).setTitle("History — تاریخچه؛ جدیدترین‌ها در بالا")
+            .setItems(labels, (dialog, which) -> {
+                String url = items.get(which);
+                if (web != null) { address.setText(url); web.loadUrl(url); }
+            })
+            .setNeutralButton("پاک‌کردن تاریخچه", (dialog, which) -> {
+                prefs().edit().putString("history_urls", "[]").apply();
+                toast("تاریخچه پاک شد");
+            })
+            .setNegativeButton("بستن", null).show();
+    }
+
+    private java.util.Set<String> getBookmarks() {
+        return new java.util.HashSet<>(prefs().getStringSet("bookmarks",new java.util.HashSet<>()));
+    }
+
+    private void updateBookmarkButton(String url) {
+        if(bookmarkButton==null)return;
+        boolean saved=url!=null&&!url.isEmpty()&&getBookmarks().contains(url);
+        bookmarkButton.setText(saved?"★":"☆"); bookmarkButton.setTextColor(saved?Color.rgb(255,170,0):Color.rgb(90,90,90));
+        bookmarkButton.setContentDescription(saved?"حذف نشانک":"افزودن نشانک");
+    }
+
+    private void toggleBookmark() {
+        String url=web==null?null:web.getUrl();
+        if(url==null||url.trim().isEmpty()){toast("آدرسی برای نشانک‌گذاری نیست");return;}
+        java.util.Set<String> saved=getBookmarks();
+        if(saved.contains(url)){saved.remove(url);prefs().edit().putStringSet("bookmarks",saved).apply();toast("نشانک حذف شد");}
+        else{saved.add(url);prefs().edit().putStringSet("bookmarks",saved).apply();toast("نشانک ذخیره شد");}
+        updateBookmarkButton(url);
+    }
+
+    private void showBookmarks() {
+        java.util.List<String> items=new java.util.ArrayList<>(getBookmarks());
+        if(items.isEmpty()){toast("هنوز نشانکی ذخیره نشده");return;}
+        String[] labels=items.toArray(new String[0]);
+        new AlertDialog.Builder(this).setTitle("نشانک‌ها — برای بازکردن لمس کن").setItems(labels,(d,which)->{if(web!=null){web.loadUrl(items.get(which));address.setText(items.get(which));}})
+                .setNeutralButton("پاک‌کردن همه",(d,w)->{prefs().edit().putStringSet("bookmarks",new java.util.HashSet<>()).apply();updateBookmarkButton(web==null?null:web.getUrl());toast("همهٔ نشانک‌ها پاک شدند");})
+                .setNegativeButton("بستن",null).show();
     }
 
     private void ipSettings() {
