@@ -14,6 +14,7 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -63,6 +64,7 @@ public class MainActivity extends Activity {
     private static final int PICK_MANUAL_UPLOAD = 603;
     private static final int PICK_VRAY = 602;
     private static final int CREATE_SAVE_FILE = 604;
+    private static final int DNS_VPN_REQUEST = 605;
     private boolean fullscreen = false;
     private boolean desktopMode = false;
     private final List<BrowserTab> tabs = new ArrayList<>();
@@ -132,7 +134,7 @@ public class MainActivity extends Activity {
         // Same single row, with buttons about 5 mm taller and distinct colors.
         int[][] buttonColors = {
             {69,90,100}, {69,90,100}, {46,125,50}, {21,101,192},
-            {123,31,162}, {230,126,34}, {0,121,107}, {45,46,49},
+            {123,31,162}, {230,126,34}, {0,121,107}, {0,137,123},
             {63,81,181}, {96,125,139}
         };
         int colorIndex = 0;
@@ -140,8 +142,8 @@ public class MainActivity extends Activity {
             Button b = makeButton(name,9f);
             b.setPadding(dp(1),0,dp(1),0);
             b.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(buttonColors[colorIndex][0],buttonColors[colorIndex][1],buttonColors[colorIndex][2])));
-            float weight = Math.max(0.72f, name.length() / 5.0f);
-            top.addView(b,new LinearLayout.LayoutParams(0,dp(59),weight));
+            // All top-row buttons use exactly the same width and height.
+            top.addView(b,new LinearLayout.LayoutParams(0,dp(59),1f));
             if ("Copy MW".equals(name)) copyMwButton = b;
             b.setOnClickListener(v -> { if ("Android Desktop".equals(name)) toggleDesktopMode(); else if ("Save".equals(name)) multiDownloadDialog(); else doAction(name); });
             colorIndex++;
@@ -454,8 +456,27 @@ public class MainActivity extends Activity {
     }
 
     private void dnsSettings() {
-        EditText a=field("DNS اصلی (IP)",prefs().getString("dns_primary",""));EditText b=field("DNS دوم (IP)",prefs().getString("dns_secondary",""));LinearLayout p=new LinearLayout(this);p.setOrientation(LinearLayout.VERTICAL);p.setPadding(dp(20),dp(8),dp(20),dp(4));p.addView(a);p.addView(b);
-        new AlertDialog.Builder(this).setTitle("تنظیم DNS").setView(p).setNeutralButton("پاک‌کردن",(d,w)->{prefs().edit().remove("dns_primary").remove("dns_secondary").apply();toast("تنظیمات ذخیره‌شده DNS پاک شد");}).setNegativeButton("لغو",null).setPositiveButton("ذخیره",(d,w)->{String x=a.getText().toString().trim(),y=b.getText().toString().trim();if(x.isEmpty()&&y.isEmpty()){toast("حداقل یک آدرس DNS وارد کن");return;}prefs().edit().putString("dns_primary",x).putString("dns_secondary",y).apply();toast("DNS ذخیره شد؛ هنوز روی اتصال اعمال نشده است");}).show();
+        EditText a=field("DNS اصلی (IPv4؛ مثال 1.1.1.1)",prefs().getString("dns_primary",""));
+        EditText b=field("DNS دوم (IPv4؛ اختیاری)",prefs().getString("dns_secondary",""));
+        LinearLayout p=new LinearLayout(this);p.setOrientation(LinearLayout.VERTICAL);p.setPadding(dp(20),dp(8),dp(20),dp(4));p.addView(a);p.addView(b);
+        AlertDialog dialog=new AlertDialog.Builder(this).setTitle("DNS واقعی دستگاه").setMessage("برای اعمال DNS، اندروید اجازهٔ اتصال VPN محلی را می‌خواهد. فقط درخواست‌های DNS از این سرویس عبور می‌کنند؛ ترافیک عادی اینترنت از تونل عبور نمی‌کند.").setView(p).setNeutralButton("خاموش‌کردن DNS",null).setNegativeButton("لغو",null).setPositiveButton("اعمال و اتصال",null).create();
+        dialog.setOnShowListener(v->{dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view->{stopDnsVpnService();dialog.dismiss();});dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view->{String x=a.getText().toString().trim(),y=b.getText().toString().trim();if(x.isEmpty()&&y.isEmpty()){toast("حداقل یک آدرس DNS وارد کن");return;}if((!x.isEmpty()&&!isValidIpv4(x))||(!y.isEmpty()&&!isValidIpv4(y))){toast("فقط آدرس IPv4 معتبر وارد کن؛ مثلاً 1.1.1.1");return;}if(x.isEmpty()){x=y;y="";}prefs().edit().putString("dns_primary",x).putString("dns_secondary",y).apply();Intent prepare=VpnService.prepare(this);if(prepare!=null){startActivityForResult(prepare,DNS_VPN_REQUEST);}else startDnsVpnService();dialog.dismiss();});});dialog.show();
+    }
+
+    private boolean isValidIpv4(String value) {
+        String[] parts=value.split("\\.",-1);if(parts.length!=4)return false;
+        for(String part:parts){if(part.isEmpty()||part.length()>3)return false;for(int i=0;i<part.length();i++)if(!Character.isDigit(part.charAt(i)))return false;try{int n=Integer.parseInt(part);if(n<0||n>255)return false;}catch(Exception e){return false;}}
+        return true;
+    }
+
+    private void startDnsVpnService() {
+        String primary=prefs().getString("dns_primary","").trim(),secondary=prefs().getString("dns_secondary","").trim();
+        Intent i=new Intent(this,DnsVpnService.class).setAction(DnsVpnService.ACTION_START).putExtra(DnsVpnService.EXTRA_PRIMARY,primary).putExtra(DnsVpnService.EXTRA_SECONDARY,secondary);
+        try{if(Build.VERSION.SDK_INT>=26)startForegroundService(i);else startService(i);toast("درخواست اتصال DNS ارسال شد؛ وضعیت VPN را بررسی کن.");}catch(Exception e){toast("شروع سرویس DNS ناموفق بود: "+e.getMessage());}
+    }
+
+    private void stopDnsVpnService() {
+        try{Intent i=new Intent(this,DnsVpnService.class).setAction(DnsVpnService.ACTION_STOP);startService(i);prefs().edit().remove("dns_primary").remove("dns_secondary").apply();toast("درخواست خاموش‌کردن DNS ارسال شد");}catch(Exception e){toast("خاموش‌کردن DNS ناموفق بود");}
     }
 
     private void tunnelSettings() {
@@ -491,6 +512,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode,int resultCode,Intent data) {
         super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode==DNS_VPN_REQUEST){if(resultCode==RESULT_OK)startDnsVpnService();else toast("اجازهٔ VPN داده نشد؛ DNS اعمال نشد");return;}
         if(requestCode==PICK_FILE){
             if(uploadCallback==null)return;Uri[] results=null;
             if(resultCode==RESULT_OK&&data!=null){if(data.getClipData()!=null){int n=data.getClipData().getItemCount();results=new Uri[n];for(int i=0;i<n;i++)results[i]=data.getClipData().getItemAt(i).getUri();}else if(data.getData()!=null)results=new Uri[]{data.getData()};}
