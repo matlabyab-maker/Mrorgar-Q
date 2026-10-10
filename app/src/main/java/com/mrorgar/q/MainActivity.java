@@ -38,6 +38,7 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -92,8 +93,11 @@ public class MainActivity extends Activity {
             if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl;
             desktopMode = state.getBoolean("desktop_mode", false);
         } else desktopMode = prefs().getBoolean("desktop_mode", false);
-        createTab(initialUrl);
-        updateDesktopButton();
+        final String urlToOpen = initialUrl;
+        restoreProxySettings(() -> {
+            createTab(urlToOpen);
+            updateDesktopButton();
+        });
     }
 
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -179,7 +183,11 @@ public class MainActivity extends Activity {
     }
 
     private void configureWeb(WebView target) {
-        WebSettings s=target.getSettings(); s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false); s.setLoadsImagesAutomatically(true); s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
+        WebSettings s=target.getSettings();
+        s.setJavaScriptEnabled(prefs().getBoolean("javascript_enabled", true));
+        s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false);
+        s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled", true));
+        s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
         CookieManager cm=CookieManager.getInstance(); cm.setAcceptCookie(true); if (Build.VERSION.SDK_INT>=21) cm.setAcceptThirdPartyCookies(target,true);
         target.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { String scheme=r.getUrl().getScheme(); return scheme!=null&&!scheme.equalsIgnoreCase("http")&&!scheme.equalsIgnoreCase("https"); }
@@ -352,13 +360,50 @@ public class MainActivity extends Activity {
     private EditText field(String hint,String value) { EditText e=new EditText(this);e.setSingleLine(true);e.setHint(hint);e.setTextSize(15);e.setPadding(dp(12),dp(8),dp(12),dp(8));if(value!=null){e.setText(value);e.setSelection(e.getText().length());}return e; }
 
     private void setupPanel() {
-        String message = "تنظیمات تکمیلی مرورگر\n\n"+
-                "دکمه‌های Back، Forward، Send، File، Copy MW، IP Set، Save، Android Desktop و F Screen روی نوار اصلی باقی می‌مانند.\n\n"+
-                "این بخش برای گزینه‌های کم‌استفادهٔ آینده در نظر گرفته شده است؛ فعلاً گزینهٔ تنظیمیِ دیگری به آن اضافه نشده تا دکمهٔ غیرعملیاتی نمایش داده نشود.";
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(20), dp(10), dp(20), dp(4));
+
+        Switch javaSwitch = new Switch(this);
+        javaSwitch.setText("JavaScript  •  اجرای کدهای سایت");
+        javaSwitch.setTextSize(15);
+        javaSwitch.setPadding(0, dp(10), 0, dp(10));
+        javaSwitch.setChecked(prefs().getBoolean("javascript_enabled", true));
+        panel.addView(javaSwitch, new LinearLayout.LayoutParams(-1, -2));
+
+        Switch photoSwitch = new Switch(this);
+        photoSwitch.setText("Photo  •  بارگذاری تصاویر");
+        photoSwitch.setTextSize(15);
+        photoSwitch.setPadding(0, dp(10), 0, dp(10));
+        photoSwitch.setChecked(prefs().getBoolean("photos_enabled", true));
+        panel.addView(photoSwitch, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView note = new TextView(this);
+        note.setText("تنظیمات پس از ذخیره برای همهٔ زبانه‌ها اعمال می‌شوند و با بستن مرورگر باقی می‌مانند. خاموش‌کردن JavaScript ممکن است بعضی سایت‌ها را از کار بیندازد.");
+        note.setTextSize(12);
+        note.setTextColor(Color.DKGRAY);
+        note.setPadding(0, dp(10), 0, dp(4));
+        panel.addView(note, new LinearLayout.LayoutParams(-1, -2));
+
         new AlertDialog.Builder(this)
                 .setTitle("Setup")
-                .setMessage(message)
-                .setPositiveButton("باشه", null)
+                .setView(panel)
+                .setNegativeButton("لغو", null)
+                .setPositiveButton("ذخیره و اعمال", (dialog, which) -> {
+                    boolean jsEnabled = javaSwitch.isChecked();
+                    boolean photosEnabled = photoSwitch.isChecked();
+                    prefs().edit()
+                            .putBoolean("javascript_enabled", jsEnabled)
+                            .putBoolean("photos_enabled", photosEnabled)
+                            .apply();
+                    for (BrowserTab tab : tabs) {
+                        WebSettings settings = tab.view.getSettings();
+                        settings.setJavaScriptEnabled(jsEnabled);
+                        settings.setLoadsImagesAutomatically(photosEnabled);
+                    }
+                    if (web != null && web.getUrl() != null && !web.getUrl().isEmpty()) web.reload();
+                    toast("تنظیمات JavaScript و تصاویر ذخیره و اعمال شد");
+                })
                 .show();
     }
 
@@ -370,6 +415,28 @@ public class MainActivity extends Activity {
     private void applyProxyDialog() {
         EditText host=field("آدرس یا IP پروکسی",prefs().getString("proxy_host",""));EditText port=field("پورت پروکسی",prefs().getString("proxy_port",""));port.setInputType(InputType.TYPE_CLASS_NUMBER);LinearLayout p=new LinearLayout(this);p.setOrientation(LinearLayout.VERTICAL);p.setPadding(dp(20),dp(8),dp(20),dp(4));p.addView(host);p.addView(port);
         new AlertDialog.Builder(this).setTitle("تنظیم Proxy").setView(p).setNeutralButton("خاموش‌کردن",(d,w)->disableProxy()).setNegativeButton("لغو",null).setPositiveButton("ذخیره و اعمال",(d,w)->applyProxy(host.getText().toString().trim(),port.getText().toString().trim())).show();
+    }
+
+    private void restoreProxySettings(Runnable onReady) {
+        boolean enabled = prefs().getBoolean("proxy_enabled", false);
+        String host = prefs().getString("proxy_host", "").trim();
+        String port = prefs().getString("proxy_port", "").trim();
+        if (!enabled || host.isEmpty() || port.isEmpty() || Build.VERSION.SDK_INT < 28) {
+            onReady.run();
+            return;
+        }
+        try {
+            int p = Integer.parseInt(port);
+            if (p < 1 || p > 65535) {
+                onReady.run();
+                return;
+            }
+            ProxyConfig config = new ProxyConfig.Builder().addProxyRule(host + ":" + p).build();
+            ProxyController.getInstance().setProxyOverride(config, Runnable::run, () -> runOnUiThread(onReady));
+        } catch (Exception ignored) {
+            // Keep the app usable if saved proxy settings are invalid or unsupported.
+            onReady.run();
+        }
     }
 
     private void applyProxy(String host,String port) {
