@@ -309,7 +309,7 @@ public class MainActivity extends Activity {
         final AlertDialog dialog=new AlertDialog.Builder(this).setTitle("دانلودها • Mrorgar-Q").setView(panel).setPositiveButton("بستن",null).setNeutralButton("تازه‌سازی",null).create();
         Runnable populate=()->{
             list.removeAllViews(); int count=0, running=0, done=0, failed=0;
-            DownloadManager.Query q=new DownloadManager.Query().setFilterByStatus(DownloadManager.STATUS_PENDING|DownloadManager.STATUS_RUNNING|DownloadManager.STATUS_PAUSED|DownloadManager.STATUS_SUCCESSFUL|DownloadManager.STATUS_FAILED).orderBy(DownloadManager.COLUMN_ID,DownloadManager.Query.ORDER_DESCENDING);
+            DownloadManager.Query q=new DownloadManager.Query().setFilterByStatus(DownloadManager.STATUS_PENDING|DownloadManager.STATUS_RUNNING|DownloadManager.STATUS_PAUSED|DownloadManager.STATUS_SUCCESSFUL|DownloadManager.STATUS_FAILED);
             Cursor c=null;
             try {
                 c=downloadManager.query(q);
