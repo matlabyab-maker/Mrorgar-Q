@@ -478,31 +478,45 @@ public class MainActivity extends Activity {
     }
 
 
-    // Every four-second hold toggles Send between its original toolbar slot and a floating position.
-    // When floating, another four-second hold returns it to the exact original toolbar slot.
+    // Send behavior:
+    // - Hold for four seconds while on the toolbar to detach it as a floating button.
+    // - Once floating, it can be dragged immediately on the next touch.
+    // - Hold it still for four seconds while floating to return it to its toolbar slot.
     private void enableFourSecondSendDrag(Button button) {
-        final Runnable arm = () -> {
+        final boolean[] longHoldTriggered = {false};
+        final boolean[] floatingAtDown = {false};
+        final Runnable[] holdAction = new Runnable[1];
+
+        holdAction[0] = () -> {
+            longHoldTriggered[0] = true;
             sendDragArmed = true;
             if (sendIsFloating) {
                 restoreSendToToolbar();
                 Toast.makeText(MainActivity.this, "دکمهٔ Send به نوار اصلی برگشت", Toast.LENGTH_SHORT).show();
             } else {
                 attachSendAsFloating();
-                Toast.makeText(MainActivity.this, "دکمهٔ Send شناور شد؛ آن را بکشید", Toast.LENGTH_SHORT).show();
+                Toast.makeText(MainActivity.this, "Send شناور شد؛ برای جابه‌جایی دوباره لمس و بکشید", Toast.LENGTH_SHORT).show();
             }
             button.setElevation(sendIsFloating ? dp(9) : 0);
         };
+
         button.setOnTouchListener((v, event) -> {
             switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_DOWN: {
                     sendDragArmed = false;
                     sendDragMoved = false;
+                    longHoldTriggered[0] = false;
+                    floatingAtDown[0] = sendIsFloating;
                     sendDownRawX = event.getRawX();
                     sendDownRawY = event.getRawY();
+
                     if (sendIsFloating) {
                         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) button.getLayoutParams();
                         sendStartLeft = lp.leftMargin;
                         sendStartTop = lp.topMargin;
+                        // While floating, movement starts immediately. A stationary 4-second hold
+                        // restores the button instead of requiring an impossible drag-after-reparent.
+                        sendDragArmed = true;
                     } else {
                         int[] hostLoc = new int[2];
                         int[] buttonLoc = new int[2];
@@ -511,31 +525,38 @@ public class MainActivity extends Activity {
                         sendStartLeft = buttonLoc[0] - hostLoc[0];
                         sendStartTop = buttonLoc[1] - hostLoc[1];
                     }
-                    button.postDelayed(arm, 4000L);
+                    button.postDelayed(holdAction[0], 4000L);
                     return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (sendDragArmed) {
-                        float dx = event.getRawX() - sendDownRawX;
-                        float dy = event.getRawY() - sendDownRawY;
-                        if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) sendDragMoved = true;
-                        if (sendIsFloating) {
-                            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) button.getLayoutParams();
-                            int maxX = Math.max(0, screenHost.getWidth() - button.getWidth());
-                            int maxY = Math.max(0, screenHost.getHeight() - button.getHeight());
-                            lp.gravity = Gravity.TOP | Gravity.LEFT;
-                            lp.leftMargin = Math.max(0, Math.min(maxX, sendStartLeft + (int) dx));
-                            lp.topMargin = Math.max(0, Math.min(maxY, sendStartTop + (int) dy));
-                            button.setLayoutParams(lp);
-                        }
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = event.getRawX() - sendDownRawX;
+                    float dy = event.getRawY() - sendDownRawY;
+                    if (Math.abs(dx) > dp(4) || Math.abs(dy) > dp(4)) {
+                        sendDragMoved = true;
+                        // Dragging a floating Send cancels the stationary hold-to-restore timer.
+                        button.removeCallbacks(holdAction[0]);
+                    }
+                    if (floatingAtDown[0] && sendIsFloating && sendDragMoved) {
+                        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) button.getLayoutParams();
+                        int maxX = Math.max(0, screenHost.getWidth() - button.getWidth());
+                        int maxY = Math.max(0, screenHost.getHeight() - button.getHeight());
+                        lp.gravity = Gravity.TOP | Gravity.LEFT;
+                        lp.leftMargin = Math.max(0, Math.min(maxX, sendStartLeft + (int) dx));
+                        lp.topMargin = Math.max(0, Math.min(maxY, sendStartTop + (int) dy));
+                        button.setLayoutParams(lp);
                     }
                     return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    button.removeCallbacks(arm);
+                }
+                case MotionEvent.ACTION_UP: {
+                    button.removeCallbacks(holdAction[0]);
                     button.setElevation(sendIsFloating ? dp(5) : 0);
-                    if (event.getActionMasked() == MotionEvent.ACTION_UP && !sendDragArmed) {
-                        button.performClick();
-                    }
+                    boolean shouldClick = !sendDragMoved && !longHoldTriggered[0];
+                    sendDragArmed = false;
+                    if (shouldClick) button.performClick();
+                    return true;
+                }
+                case MotionEvent.ACTION_CANCEL:
+                    button.removeCallbacks(holdAction[0]);
                     sendDragArmed = false;
                     return true;
             }
@@ -583,8 +604,8 @@ public class MainActivity extends Activity {
         sendIsFloating = false;
     }
 
-    // Hold a toolbar button for two seconds, then drag horizontally to reorder it.
-    // A short tap still triggers the button's original action.
+    // Hold a toolbar button briefly (650 ms), then drag horizontally to reorder it.
+    // A normal short tap still triggers the button's original action.
     private void enableTwoSecondDragReorder(Button button, LinearLayout parent) {
         final boolean[] armed = {false};
         final boolean[] dragging = {false};
@@ -593,7 +614,7 @@ public class MainActivity extends Activity {
         final int[] originalIndex = {-1};
         final Runnable armDrag = () -> {
             armed[0] = true;
-            Toast.makeText(MainActivity.this, "دکمه آمادهٔ جابه‌جایی است؛ آن را بکشید", Toast.LENGTH_SHORT).show();
+            Toast.makeText(MainActivity.this, "آمادهٔ جابه‌جایی؛ بکشید", Toast.LENGTH_SHORT).show();
         };
         button.setOnTouchListener((v, event) -> {
             switch (event.getActionMasked()) {
@@ -603,7 +624,7 @@ public class MainActivity extends Activity {
                     downRawX[0] = event.getRawX();
                     downRawY[0] = event.getRawY();
                     originalIndex[0] = parent.indexOfChild(button);
-                    button.postDelayed(armDrag, 2000L);
+                    button.postDelayed(armDrag, 650L);
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     float dx = event.getRawX() - downRawX[0];
@@ -758,12 +779,26 @@ public class MainActivity extends Activity {
     private void changePageZoom(int delta) {
         if (web == null) return;
         int next = Math.max(40, Math.min(200, zoomPercent + delta));
-        if (next == zoomPercent) { toast(next <= 40 ? "حداقل بزرگ‌نمایی ۴۰٪ است" : "حداکثر بزرگ‌نمایی ۲۰۰٪ است"); return; }
+        if (next == zoomPercent) {
+            toast(next <= 40 ? "حداقل بزرگ‌نمایی ۴۰٪ است" : "حداکثر بزرگ‌نمایی ۲۰۰٪ است");
+            return;
+        }
         float factor = next / (float) zoomPercent;
-        try { web.zoomBy(factor); zoomPercent = next; toast("بزرگ‌نمایی صفحه: " + zoomPercent + "%"); }
-        catch (Exception e) { toast("تغییر بزرگ‌نمایی در این صفحه پشتیبانی نشد"); }
+        try {
+            // zoomBy changes the live page scale without applying the scale twice.
+            web.getSettings().setSupportZoom(true);
+            web.getSettings().setBuiltInZoomControls(true);
+            web.getSettings().setDisplayZoomControls(false);
+            web.zoomBy(factor);
+            zoomPercent = next;
+            toast("بزرگ‌نمایی صفحه: " + zoomPercent + "%");
+        } catch (Exception e) {
+            toast("این صفحه اجازهٔ تغییر مقیاس را نمی‌دهد");
+        }
     }
 
+    // Each press cycles: floating 1 -> floating 2 -> floating 3 -> normal app window.
+    // The first press immediately creates a genuinely smaller overlay, rather than a full-screen overlay.
     private void cycleBrowserWindowSize() {
         if (Build.VERSION.SDK_INT < 23) { toast("پنجره شناور به اندروید ۶ یا بالاتر نیاز دارد"); return; }
         if (!Settings.canDrawOverlays(this)) {
@@ -779,35 +814,48 @@ public class MainActivity extends Activity {
                 if (root.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) root.getParent()).removeView(root);
                 overlayWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
                 int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
-                overlayWindowParams = new WindowManager.LayoutParams(getScreenWidthPx(), getScreenHeightPx(), type,
+                overlayWindowParams = new WindowManager.LayoutParams(
+                        Math.max(dp(240), (int)(getScreenWidthPx() * 0.82f)),
+                        Math.max(dp(200), (int)(getScreenHeightPx() * 0.76f)), type,
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                         android.graphics.PixelFormat.TRANSLUCENT);
-                // Overlay must remain focusable so login, password and one-time-code fields can open the keyboard.
+                // Keep the overlay focusable so site forms and the Android keyboard can work.
                 overlayWindowParams.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
                 overlayWindowParams.gravity = Gravity.CENTER;
                 overlayWindowManager.addView(root, overlayWindowParams);
-                floatingWindowActive = true; windowSizeStep = 0;
-                windowSizeButton.setText("▣");
-                moveTaskToBack(true);
-                toast("پنجره شناور فعال شد؛ لمس برای تغییر اندازه، نگه‌داشتن برای بازگشت به برنامه");
+                floatingWindowActive = true;
+                windowSizeStep = 1;
+                windowSizeButton.setText("▣۱");
+                // Do not send the Activity to the back: it is the host we return to when the
+                // overlay is removed, and moving it back can leave the user on the home screen.
+                root.requestLayout();
+                toast("پنجره کوچک ۱");
             } catch (Exception e) {
                 floatingWindowActive = false;
                 try { if (root.getParent() == null) screenHost.addView(root, new FrameLayout.LayoutParams(-1,-1)); } catch (Exception ignored) {}
-                toast("ساخت پنجره شناور ناموفق بود: مجوز نمایش روی برنامه‌های دیگر را بررسی کن");
+                toast("ساخت پنجره شناور ناموفق بود؛ مجوز نمایش روی برنامه‌های دیگر را بررسی کن");
             }
             return;
         }
-        windowSizeStep = (windowSizeStep + 1) % 4;
-        float[] factors = {1.0f, 0.82f, 0.64f, 0.46f};
-        float factor = factors[windowSizeStep];
-        overlayWindowParams.width = Math.max(dp(220), (int)(getScreenWidthPx() * factor));
-        overlayWindowParams.height = Math.max(dp(180), (int)(getScreenHeightPx() * factor));
+        if (windowSizeStep >= 3) {
+            exitFloatingBrowserWindow();
+            toast("بازگشت به اندازهٔ عادی");
+            return;
+        }
+        windowSizeStep++;
+        float[] widthFactors = {1.0f, 0.82f, 0.64f, 0.46f};
+        float[] heightFactors = {1.0f, 0.76f, 0.58f, 0.42f};
+        overlayWindowParams.width = Math.max(dp(220), (int)(getScreenWidthPx() * widthFactors[windowSizeStep]));
+        overlayWindowParams.height = Math.max(dp(180), (int)(getScreenHeightPx() * heightFactors[windowSizeStep]));
         try {
             overlayWindowManager.updateViewLayout(root, overlayWindowParams);
             root.requestLayout();
+            if (windowSizeButton != null) windowSizeButton.setText("▣" + windowSizeStep);
             String[] labels = {"اندازه عادی", "پنجره کوچک ۱", "پنجره کوچک ۲", "پنجره کوچک ۳"};
             toast(labels[windowSizeStep]);
-        } catch (Exception e) { toast("تغییر اندازه پنجره انجام نشد"); }
+        } catch (Exception e) {
+            toast("تغییر اندازهٔ پنجره انجام نشد؛ مجوز شناور را بررسی کن");
+        }
     }
 
     private int getScreenWidthPx() {
@@ -826,11 +874,33 @@ public class MainActivity extends Activity {
             if (floatingWindowActive && overlayWindowManager != null && root.getParent() != null) overlayWindowManager.removeView(root);
         } catch (Exception ignored) {}
         floatingWindowActive = false; windowSizeStep = 0; overlayWindowParams = null;
+        if (windowSizeButton != null) windowSizeButton.setText("▣");
         try {
             screenHost.removeAllViews();
             screenHost.addView(root, new FrameLayout.LayoutParams(-1,-1));
             setContentView(screenHost);
         } catch (Exception e) { toast("بازگرداندن پنجره به برنامه ناموفق بود"); }
+    }
+
+    private boolean isGoogleAuthenticationUrl(Uri uri) {
+        if (uri == null) return false;
+        String host = uri.getHost();
+        if (host == null) return false;
+        host = host.toLowerCase(java.util.Locale.ROOT);
+        String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase(java.util.Locale.ROOT);
+        // Do not send all Google pages outside the app; only account/sign-in endpoints.
+        return host.equals("accounts.google.com")
+                || (host.equals("www.google.com") && (path.startsWith("/accounts/") || path.startsWith("/signin/")))
+                || (host.equals("google.com") && (path.startsWith("/accounts/") || path.startsWith("/signin/")));
+    }
+
+    private void openUrlInSystemBrowser(Uri uri) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+            startActivity(intent);
+        } catch (Exception e) {
+            toast("برای ورود امن گوگل، مرورگر دستگاه در دسترس نیست. Chrome یا یک مرورگر وب را نصب/فعال کن.");
+        }
     }
 
     private void configureWeb(WebView target) {
@@ -860,7 +930,35 @@ public class MainActivity extends Activity {
         applyUserAgent(target);
         CookieManager cm=CookieManager.getInstance(); cm.setAcceptCookie(true); if (Build.VERSION.SDK_INT>=21) cm.setAcceptThirdPartyCookies(target,true);
         target.setWebViewClient(new WebViewClient() {
-            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { String scheme=r.getUrl().getScheme(); return scheme!=null&&!scheme.equalsIgnoreCase("http")&&!scheme.equalsIgnoreCase("https"); }
+            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                Uri uri = r.getUrl();
+                // Google blocks account/OAuth sign-in in embedded WebViews on many flows.
+                // Hand only the authentication step to the device browser; normal sites remain in Mrorgar-Q.
+                if (isGoogleAuthenticationUrl(uri)) {
+                    openUrlInSystemBrowser(uri);
+                    return true;
+                }
+                String scheme = uri.getScheme();
+                if (scheme != null && !scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https")) {
+                    openUrlInSystemBrowser(uri);
+                    return true;
+                }
+                return false;
+            }
+            @Override public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                if (url == null) return false;
+                Uri uri = Uri.parse(url);
+                if (isGoogleAuthenticationUrl(uri)) {
+                    openUrlInSystemBrowser(uri);
+                    return true;
+                }
+                String scheme = uri.getScheme();
+                if (scheme != null && !scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https")) {
+                    openUrlInSystemBrowser(uri);
+                    return true;
+                }
+                return false;
+            }
             @Override public void onPageStarted(WebView v,String url,Bitmap icon) { updateTabInfo(target,url); }
             @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); if (url == null || !url.startsWith("https://mrorgar.home/")) addHistoryEntry(url); }
         });
