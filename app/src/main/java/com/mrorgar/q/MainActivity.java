@@ -14,6 +14,7 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.net.http.SslError;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
@@ -35,6 +36,8 @@ import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceError;
+import android.webkit.SslErrorHandler;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -913,9 +916,15 @@ public class MainActivity extends Activity {
         s.setSupportZoom(true);
         s.setBuiltInZoomControls(true);
         s.setDisplayZoomControls(false);
-        s.setSupportMultipleWindows(false);
-        s.setJavaScriptCanOpenWindowsAutomatically(false);
+        // Support modern sites that open links, media, or sign-in pages in a new window.
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled",true));
+        s.setBlockNetworkImage(!prefs().getBoolean("photos_enabled",true));
+        if (Build.VERSION.SDK_INT >= 21) {
+            // Compatibility mode permits legacy mixed-content pages without bypassing TLS checks.
+            s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        }
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
         s.setMediaPlaybackRequiresUserGesture(false);
@@ -961,8 +970,57 @@ public class MainActivity extends Activity {
             }
             @Override public void onPageStarted(WebView v,String url,Bitmap icon) { updateTabInfo(target,url); }
             @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); if (url == null || !url.startsWith("https://mrorgar.home/")) addHistoryEntry(url); }
+            @Override public void onReceivedError(WebView v, WebResourceRequest request, WebResourceError error) {
+                if (request != null && request.isForMainFrame()) {
+                    String description = error == null ? "خطای شبکه" : String.valueOf(error.getDescription());
+                    toast("بازکردن صفحه ناموفق بود: " + description);
+                }
+            }
+            @Override public void onReceivedError(WebView v, int errorCode, String description, String failingUrl) {
+                if (Build.VERSION.SDK_INT < 23) toast("بازکردن صفحه ناموفق بود: " + description);
+            }
+            @Override public void onReceivedHttpError(WebView v, WebResourceRequest request, android.webkit.WebResourceResponse response) {
+                if (request != null && request.isForMainFrame() && response != null && response.getStatusCode() >= 400) {
+                    toast("خطای سایت: HTTP " + response.getStatusCode());
+                }
+            }
+            @Override public void onReceivedSslError(WebView v, SslErrorHandler handler, SslError error) {
+                // Never bypass an invalid certificate; cancel securely and explain why the page stopped.
+                handler.cancel();
+                toast("گواهی امنیتی سایت معتبر نیست؛ اتصال لغو شد.");
+            }
         });
         target.setWebChromeClient(new WebChromeClient() {
+            @Override public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+                // Redirect target=_blank / window.open navigations into the current browser tab.
+                final WebView popup = new WebView(MainActivity.this);
+                popup.setBackgroundColor(Color.WHITE);
+                popup.getSettings().setJavaScriptEnabled(prefs().getBoolean("javascript_enabled", true));
+                popup.getSettings().setDomStorageEnabled(true);
+                popup.getSettings().setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled", true));
+                popup.setWebViewClient(new WebViewClient() {
+                    private boolean redirected;
+                    private void forward(String url) {
+                        if (redirected || url == null || url.trim().isEmpty() || "about:blank".equals(url)) return;
+                        redirected = true;
+                        target.loadUrl(url);
+                        try { if (popup.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup)popup.getParent()).removeView(popup); popup.stopLoading(); popup.destroy(); } catch (Exception ignored) { }
+                    }
+                    @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                        String url = request.getUrl().toString();
+                        if (url.startsWith("http://") || url.startsWith("https://")) { forward(url); return true; }
+                        return false;
+                    }
+                    @Override public void onPageStarted(WebView v, String url, Bitmap icon) {
+                        if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) forward(url);
+                    }
+                });
+                stage.addView(popup, new FrameLayout.LayoutParams(1, 1));
+                android.webkit.WebView.WebViewTransport transport = (android.webkit.WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(popup);
+                resultMsg.sendToTarget();
+                return true;
+            }
             @Override public void onRequestFocus(WebView v) {
                 // Some login/OTP pages ask the host WebView to take focus before showing the IME.
                 v.setFocusable(true);
