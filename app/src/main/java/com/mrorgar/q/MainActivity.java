@@ -17,6 +17,11 @@ import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Parcel;
+import android.provider.Settings;
+import android.util.Base64;
 import android.os.Environment;
 import android.text.InputType;
 import android.view.Gravity;
@@ -51,16 +56,34 @@ import org.json.JSONArray;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
 import java.util.List;
 
 public class MainActivity extends Activity {
     private WebView web;
     private EditText address;
     private LinearLayout root, top, tabStrip, tabRow, addressRow;
-    private FrameLayout stage;
+    private FrameLayout screenHost, stage;
+    private Button sendButton;
+    private android.view.ViewGroup sendOriginalParent;
+    private android.view.ViewGroup.LayoutParams sendOriginalLayoutParams;
+    private int sendOriginalIndex = -1;
+    private boolean sendIsFloating = false;
+    private float sendDownRawX, sendDownRawY;
+    private int sendStartLeft, sendStartTop;
+    private boolean sendDragArmed = false, sendDragMoved = false;
     private Button restoreButton;
     private Button bookmarkButton;
     private Button copyMwButton;
+    private Button windowSizeButton;
+    private WindowManager overlayWindowManager;
+    private WindowManager.LayoutParams overlayWindowParams;
+    private boolean floatingWindowActive = false;
+    private int windowSizeStep = 0; // 0=normal, 1..3=progressively smaller
+    private int zoomPercent = 100;
     private boolean copyMwArmed = false;
     private ValueCallback<Uri[]> uploadCallback;
     private DownloadManager downloadManager;
@@ -80,6 +103,16 @@ public class MainActivity extends Activity {
     private String pendingSaveMime = "text/html";
     private String pendingSaveName = "page.html";
 
+    // Hourly random light effect for the real top toolbar buttons.
+    private final Handler hourlyLightHandler = new Handler(Looper.getMainLooper());
+    private final Random hourlyLightRandom = new Random();
+    private final Map<View, ColorStateList> hourlyOriginalTints = new HashMap<>();
+    private final Map<View, Integer> hourlyOriginalTextColors = new HashMap<>();
+    private Runnable hourlyClockCheck;
+    private Runnable hourlyLightStep;
+    private int hourlyLightGeneration = 0;
+    private long lastHourlyFlashKey = Long.MIN_VALUE;
+
     private class BrowserTab {
         WebView view;
         String title = "New tab";
@@ -98,23 +131,150 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
         downloadManager = (DownloadManager)getSystemService(DOWNLOAD_SERVICE);
         buildUI();
-        String initialUrl = "mrorgar://home";
-        if (state != null) {
-            String savedUrl = state.getString("current_url");
-            if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl.startsWith("https://mrorgar.home/") ? "mrorgar://home" : savedUrl;
-            desktopMode = state.getBoolean("desktop_mode", false);
-        } else desktopMode = prefs().getBoolean("desktop_mode", false);
-        createTab(initialUrl);
+        desktopMode = state != null
+                ? state.getBoolean("desktop_mode", prefs().getBoolean("desktop_mode", false))
+                : prefs().getBoolean("desktop_mode", false);
+        zoomPercent = desktopMode ? 40 : 100;
+        boolean restored = restoreBrowserSession();
+        if (!restored) {
+            String initialUrl = "mrorgar://home";
+            if (state != null) {
+                String savedUrl = state.getString("current_url");
+                if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl.startsWith("https://mrorgar.home/") ? "mrorgar://home" : savedUrl;
+            }
+            createTab(initialUrl);
+        }
         updateDesktopButton();
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        startHourlyLightClock();
+    }
+
+    // Persist every open WebView's navigation history, current page and tab order.
+    // This lets the browser recover its session after Android reclaims the process.
+    @Override protected void onPause() {
+        stopHourlyLightClock();
+        saveBrowserSession();
+        // Keep the WebView active while it is shown in the user's floating overlay window.
+        if (!floatingWindowActive) {
+            for (BrowserTab t : tabs) { try { t.view.onPause(); } catch (Exception ignored) {} }
+        }
+        super.onPause();
+    }
+
+    @Override protected void onStop() {
+        saveBrowserSession();
+        super.onStop();
+    }
+
     @Override protected void onSaveInstanceState(Bundle out) {
+        saveBrowserSession();
         super.onSaveInstanceState(out);
         if (web != null && web.getUrl() != null) out.putString("current_url", web.getUrl());
         out.putBoolean("desktop_mode", desktopMode);
     }
 
+    private void saveBrowserSession() {
+        try {
+            JSONArray savedTabs = new JSONArray();
+            for (BrowserTab t : tabs) {
+                JSONObject item = new JSONObject();
+                String url = t.view.getUrl();
+                item.put("url", url == null ? t.lastUrl : url);
+                item.put("title", t.title == null ? "New tab" : t.title);
+                item.put("scrollX", t.view.getScrollX());
+                item.put("scrollY", t.view.getScrollY());
+                Bundle state = new Bundle();
+                t.view.saveState(state);
+                Parcel parcel = Parcel.obtain();
+                try {
+                    parcel.writeBundle(state);
+                    item.put("webState", Base64.encodeToString(parcel.marshall(), Base64.NO_WRAP));
+                } finally { parcel.recycle(); }
+                savedTabs.put(item);
+            }
+            prefs().edit().putString("browser_session_tabs", savedTabs.toString())
+                    .putInt("browser_session_active", Math.max(0, activeTabIndex))
+                    .putBoolean("desktop_mode", desktopMode).apply();
+        } catch (Exception ignored) { /* Keep the last good session if a page cannot be serialized. */ }
+    }
+
+    private boolean restoreBrowserSession() {
+        String raw = prefs().getString("browser_session_tabs", "");
+        if (raw == null || raw.trim().isEmpty()) return false;
+        try {
+            JSONArray savedTabs = new JSONArray(raw);
+            if (savedTabs.length() == 0) return false;
+            int desiredActive = Math.max(0, Math.min(prefs().getInt("browser_session_active", 0), savedTabs.length() - 1));
+            for (int i = 0; i < savedTabs.length(); i++) {
+                JSONObject item = savedTabs.getJSONObject(i);
+                String url = item.optString("url", "mrorgar://home");
+                String encoded = item.optString("webState", "");
+                boolean restoredWebState = false;
+                WebView view = new WebView(this);
+                BrowserTab tab = new BrowserTab(view);
+                tab.lastUrl = url;
+                tab.title = item.optString("title", "New tab");
+                tabs.add(tab);
+                view.setVisibility(View.GONE);
+                stage.addView(view, 0, new FrameLayout.LayoutParams(-1, -1));
+                LinearLayout chip = new LinearLayout(this);
+                chip.setOrientation(LinearLayout.HORIZONTAL);
+                chip.setGravity(Gravity.CENTER_VERTICAL);
+                chip.setPadding(dp(3), 0, dp(2), 0);
+                tab.chip = chip;
+                Button select = makeButton("▣ "+tab.title, 10);
+                select.setTextColor(Color.BLACK);
+                select.setBackgroundTintList(ColorStateList.valueOf(Color.WHITE));
+                tab.selectButton = select;
+                chip.addView(select, new LinearLayout.LayoutParams(-2, dp(32)));
+                enableTabDrag(select, tab);
+                Button close = new Button(this);
+                close.setText("✕"); close.setTextSize(15); close.setAllCaps(false); close.setPadding(0,0,0,0);
+                close.setMinWidth(0); close.setMinimumWidth(0); close.setMinHeight(0); close.setMinimumHeight(0);
+                tab.closeButton = close;
+                chip.addView(close, new LinearLayout.LayoutParams(dp(27), dp(32)));
+                close.setOnClickListener(v -> closeTab(tabs.indexOf(tab)));
+                tabStrip.addView(chip, new LinearLayout.LayoutParams(-2, dp(36)));
+                configureWeb(view);
+                view.setOnTouchListener((v, event) -> {
+                    if (copyMwArmed && event.getAction() == MotionEvent.ACTION_UP) v.postDelayed(() -> handleCopyMWSelection(), 120);
+                    return false;
+                });
+                if (!encoded.isEmpty()) {
+                    Parcel parcel = Parcel.obtain();
+                    try {
+                        byte[] bytes = Base64.decode(encoded, Base64.NO_WRAP);
+                        parcel.unmarshall(bytes, 0, bytes.length);
+                        parcel.setDataPosition(0);
+                        Bundle webState = parcel.readBundle(getClassLoader());
+                        if (webState != null) restoredWebState = view.restoreState(webState) != null;
+                    } catch (Exception ignored) { restoredWebState = false; }
+                    finally { parcel.recycle(); }
+                }
+                if (!restoredWebState) {
+                    if ("mrorgar://home".equals(url) || url.startsWith("https://mrorgar.home/")) loadHomePage(view);
+                    else if (!url.isEmpty()) view.loadUrl(url);
+                }
+                final int sx = item.optInt("scrollX", 0), sy = item.optInt("scrollY", 0);
+                view.post(() -> view.scrollTo(sx, sy));
+            }
+            selectTab(desiredActive);
+            return !tabs.isEmpty();
+        } catch (Exception e) {
+            for (BrowserTab t : tabs) { try { stage.removeView(t.view); t.view.destroy(); } catch (Exception ignored) {} }
+            tabs.clear(); tabStrip.removeAllViews(); activeTabIndex = -1;
+            return false;
+        }
+    }
+
     @Override protected void onDestroy() {
+        if (floatingWindowActive) {
+            try { if (overlayWindowManager != null && root.getParent() != null) overlayWindowManager.removeView(root); } catch (Exception ignored) {}
+            floatingWindowActive = false;
+        }
         if (uploadCallback != null) { uploadCallback.onReceiveValue(null); uploadCallback = null; }
         for (BrowserTab t : tabs) { try { t.view.destroy(); } catch (Exception ignored) {} }
         super.onDestroy();
@@ -126,6 +286,86 @@ public class MainActivity extends Activity {
         super.onBackPressed();
     }
 
+    private void startHourlyLightClock() {
+        stopHourlyLightClock();
+        hourlyClockCheck = new Runnable() {
+            @Override public void run() {
+                Calendar now = Calendar.getInstance();
+                if (now.get(Calendar.MINUTE) == 0) {
+                    long key = (((long) now.get(Calendar.YEAR) * 400L + now.get(Calendar.DAY_OF_YEAR)) * 24L)
+                            + now.get(Calendar.HOUR_OF_DAY);
+                    if (key != lastHourlyFlashKey) {
+                        lastHourlyFlashKey = key;
+                        beginHourlyRandomLight();
+                    }
+                }
+                hourlyLightHandler.postDelayed(this, 500L);
+            }
+        };
+        hourlyLightHandler.post(hourlyClockCheck);
+    }
+
+    private void stopHourlyLightClock() {
+        if (hourlyClockCheck != null) hourlyLightHandler.removeCallbacks(hourlyClockCheck);
+        if (hourlyLightStep != null) hourlyLightHandler.removeCallbacks(hourlyLightStep);
+        hourlyClockCheck = null;
+        hourlyLightStep = null;
+        restoreHourlyToolbarColors();
+    }
+
+    private void beginHourlyRandomLight() {
+        if (top == null || top.getChildCount() == 0) return;
+        final int generation = ++hourlyLightGeneration;
+        hourlyOriginalTints.clear();
+        hourlyOriginalTextColors.clear();
+        for (int i = 0; i < top.getChildCount(); i++) {
+            View child = top.getChildAt(i);
+            if (child instanceof Button) {
+                Button b = (Button) child;
+                hourlyOriginalTints.put(b, b.getBackgroundTintList());
+                hourlyOriginalTextColors.put(b, b.getCurrentTextColor());
+            }
+        }
+        final long endAt = android.os.SystemClock.uptimeMillis() + 2000L;
+        hourlyLightStep = new Runnable() {
+            @Override public void run() {
+                if (generation != hourlyLightGeneration) return;
+                if (android.os.SystemClock.uptimeMillis() >= endAt) {
+                    restoreHourlyToolbarColors();
+                    hourlyLightStep = null;
+                    return;
+                }
+                for (int i = 0; i < top.getChildCount(); i++) {
+                    View child = top.getChildAt(i);
+                    if (!(child instanceof Button)) continue;
+                    Button b = (Button) child;
+                    int r = 70 + hourlyLightRandom.nextInt(186);
+                    int g = 70 + hourlyLightRandom.nextInt(186);
+                    int bl = 70 + hourlyLightRandom.nextInt(186);
+                    int color = Color.rgb(r, g, bl);
+                    b.setBackgroundTintList(ColorStateList.valueOf(color));
+                    b.setTextColor((r * 299 + g * 587 + bl * 114) / 1000 >= 150 ? Color.BLACK : Color.WHITE);
+                }
+                hourlyLightHandler.postDelayed(this, 120L);
+            }
+        };
+        hourlyLightHandler.post(hourlyLightStep);
+    }
+
+    private void restoreHourlyToolbarColors() {
+        hourlyLightGeneration++;
+        for (Map.Entry<View, ColorStateList> entry : hourlyOriginalTints.entrySet()) {
+            View v = entry.getKey();
+            if (v instanceof Button) {
+                ((Button) v).setBackgroundTintList(entry.getValue());
+                Integer textColor = hourlyOriginalTextColors.get(v);
+                if (textColor != null) ((Button) v).setTextColor(textColor);
+            }
+        }
+        hourlyOriginalTints.clear();
+        hourlyOriginalTextColors.clear();
+    }
+
     private Button makeButton(String label, float textSize) {
         Button b = new Button(this);
         b.setText(label); b.setTextSize(textSize); b.setTextColor(Color.WHITE); b.setAllCaps(false);
@@ -135,18 +375,24 @@ public class MainActivity extends Activity {
     }
 
     private void buildUI() {
+        screenHost = new FrameLayout(this);
         root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(Color.WHITE);
         top = new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL); top.setBackgroundColor(Color.rgb(32,33,36));
-        String[] names = {"Back","Forward","Send","File","Copy MW","IP Set","Save","Android Desktop","F Screen","Setup"};
+        String[] names = {"Back","Forward","Copy MW","IP Set","Save","Android Desktop","F Screen","Setup","File","Send"};
+        String[] buttonLabels = {"‹\nBack", "›\nForward", "▣\nCopy MW", "⚙\nIP Set", "↓\nSave", "▤\nDesktop", "⛶\nFull", "☰\nSetup", "▰\nFile", "➤\nSend"};
         // Same single row, with buttons about 5 mm taller and distinct colors.
         int[][] buttonColors = {
-            {69,90,100}, {69,90,100}, {46,125,50}, {21,101,192},
-            {123,31,162}, {230,126,34}, {0,121,107}, {0,137,123},
-            {63,81,181}, {96,125,139}
+            {69,90,100}, {69,90,100}, {123,31,162}, {230,126,34},
+            {0,121,107}, {0,137,123}, {63,81,181}, {96,125,139},
+            {21,101,192}, {46,125,50}
         };
         int colorIndex = 0;
-        for (String name : names) {
-            Button b = makeButton(name,9f);
+        for (int buttonIndex = 0; buttonIndex < names.length; buttonIndex++) {
+            String name = names[buttonIndex];
+            Button b = makeButton(buttonLabels[buttonIndex],9f);
+            b.setSingleLine(false);
+            b.setGravity(Gravity.CENTER);
+            b.setLineSpacing(0, 0.9f);
             b.setPadding(0,0,0,0);
             // Use a drawable without the stock Button's wide built-in insets, so the gaps shrink.
             b.setBackground(new android.graphics.drawable.GradientDrawable());
@@ -156,8 +402,18 @@ public class MainActivity extends Activity {
             buttonLp.setMargins(dp(1),0,dp(1),0);
             top.addView(b,buttonLp);
             if ("Copy MW".equals(name)) copyMwButton = b;
-            b.setOnClickListener(v -> { if ("Android Desktop".equals(name)) toggleDesktopMode(); else if ("Save".equals(name)) multiDownloadDialog(); else doAction(name); });
-            enableTwoSecondDragReorder(b, top);
+            if ("Send".equals(name)) {
+                sendButton = b;
+                b.setOnClickListener(v -> doAction("Send"));
+                enableFourSecondSendDrag(b);
+            } else {
+                b.setOnClickListener(v -> {
+                    if ("Android Desktop".equals(name)) toggleDesktopMode();
+                    else if ("Save".equals(name)) multiDownloadDialog();
+                    else doAction(name);
+                });
+                enableTwoSecondDragReorder(b, top);
+            }
             colorIndex++;
         }
         root.addView(top,new LinearLayout.LayoutParams(-1,dp(59)));
@@ -168,25 +424,36 @@ public class MainActivity extends Activity {
         addressRow.addView(bookmarkButton,new LinearLayout.LayoutParams(dp(42),dp(42)));
         bookmarkButton.setOnClickListener(v -> toggleBookmark());
         bookmarkButton.setOnLongClickListener(v -> { showBookmarks(); return true; });
-        Button go = makeButton("Go",10); go.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(232,234,237))); go.setTextColor(Color.BLACK);
+        Button go = makeButton("⌕ Go",10); go.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(232,234,237))); go.setTextColor(Color.BLACK);
         addressRow.addView(go,new LinearLayout.LayoutParams(dp(48),dp(42))); go.setOnClickListener(v -> loadAddress());
-        Button home = makeButton("خانه",10); home.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(0,121,107))); home.setTextColor(Color.WHITE);
+        Button home = makeButton("⌂ خانه",10); home.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(0,121,107))); home.setTextColor(Color.WHITE);
         addressRow.addView(home,new LinearLayout.LayoutParams(dp(48),dp(42))); home.setOnClickListener(v -> { if (web != null) loadHomePage(web); });
         root.addView(addressRow,new LinearLayout.LayoutParams(-1,dp(42)));
         tabRow = new LinearLayout(this); tabRow.setOrientation(LinearLayout.HORIZONTAL); tabRow.setGravity(Gravity.CENTER_VERTICAL); tabRow.setBackgroundColor(Color.rgb(238,239,241));
         // These two navigation buttons are fixed: they are deliberately not attached to the drag/reorder handler.
-        Button history = makeButton("History",9f); history.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(69,90,100)));
+        Button history = makeButton("◷ History",9f); history.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(69,90,100)));
         tabRow.addView(history,new LinearLayout.LayoutParams(dp(62),dp(34))); history.setOnClickListener(v -> showHistory());
-        Button favorites = makeButton("Favorites",9f); favorites.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(230,126,34)));
+        Button favorites = makeButton("★ Favorites",9f); favorites.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(230,126,34)));
         tabRow.addView(favorites,new LinearLayout.LayoutParams(dp(72),dp(34))); favorites.setOnClickListener(v -> showBookmarks());
+        Button zoomOut = makeButton("−",15); zoomOut.setContentDescription("کوچک‌کردن صفحه تا ۴۰٪");
+        tabRow.addView(zoomOut,new LinearLayout.LayoutParams(dp(31),dp(34)));
+        zoomOut.setOnClickListener(v -> changePageZoom(-20));
+        Button zoomIn = makeButton("+",15); zoomIn.setContentDescription("بزرگ‌کردن صفحه تا ۲۰۰٪");
+        tabRow.addView(zoomIn,new LinearLayout.LayoutParams(dp(31),dp(34)));
+        zoomIn.setOnClickListener(v -> changePageZoom(20));
+        windowSizeButton = makeButton("▣",14); windowSizeButton.setContentDescription("تغییر اندازه پنجره مرورگر؛ نگه‌داشتن برای خروج از حالت شناور");
+        windowSizeButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(69,90,100)));
+        tabRow.addView(windowSizeButton,new LinearLayout.LayoutParams(dp(34),dp(34)));
+        windowSizeButton.setOnClickListener(v -> cycleBrowserWindowSize());
+        windowSizeButton.setOnLongClickListener(v -> { if (floatingWindowActive) exitFloatingBrowserWindow(); else toast("برای پنجره شناور، دکمه را لمس کن و مجوز نمایش روی برنامه‌های دیگر را بده"); return true; });
         HorizontalScrollView scroll = new HorizontalScrollView(this); scroll.setHorizontalScrollBarEnabled(false);
         tabStrip = new LinearLayout(this); tabStrip.setOrientation(LinearLayout.HORIZONTAL); scroll.addView(tabStrip,new HorizontalScrollView.LayoutParams(-2,-1));
         tabRow.addView(scroll,new LinearLayout.LayoutParams(0,dp(36),1));
-        Button add = new Button(this); add.setText("+"); add.setTextSize(20); add.setAllCaps(false); add.setPadding(0,0,0,0); add.setMinWidth(0); add.setMinimumWidth(0);
+        Button add = new Button(this); add.setText("＋"); add.setTextSize(20); add.setAllCaps(false); add.setPadding(0,0,0,0); add.setMinWidth(0); add.setMinimumWidth(0);
         tabRow.addView(add,new LinearLayout.LayoutParams(dp(38),dp(36))); add.setOnClickListener(v -> createTab("https://www.google.com"));
         root.addView(tabRow,new LinearLayout.LayoutParams(-1,dp(36)));
         stage = new FrameLayout(this); root.addView(stage,new LinearLayout.LayoutParams(-1,0,1));
-        restoreButton = new Button(this); restoreButton.setText("↗"); restoreButton.setTextSize(18); restoreButton.setAllCaps(false); restoreButton.setVisibility(View.GONE); restoreButton.setTextColor(Color.WHITE);
+        restoreButton = new Button(this); restoreButton.setText("⤢"); restoreButton.setTextSize(18); restoreButton.setAllCaps(false); restoreButton.setVisibility(View.GONE); restoreButton.setTextColor(Color.WHITE);
         restoreButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(137,171,192))); restoreButton.setBackgroundColor(Color.rgb(137,171,192)); restoreButton.setAlpha(0.92f); restoreButton.setElevation(dp(5)); restoreButton.setPadding(0,0,0,0);
         FrameLayout.LayoutParams restoreLp = new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.LEFT); restoreLp.leftMargin=dp(8); restoreLp.topMargin=dp(90);
         stage.addView(restoreButton,restoreLp);
@@ -202,10 +469,116 @@ public class MainActivity extends Activity {
                 case MotionEvent.ACTION_CANCEL:return true;
             } return true;
         });
-        setContentView(root);
+        screenHost.addView(root, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(screenHost);
         address.setOnEditorActionListener((v,id,event) -> { if (id==EditorInfo.IME_ACTION_GO||id==EditorInfo.IME_ACTION_DONE||id==EditorInfo.IME_ACTION_SEARCH) { loadAddress(); return true; } return false; });
     }
 
+
+    // Every four-second hold toggles Send between its original toolbar slot and a floating position.
+    // When floating, another four-second hold returns it to the exact original toolbar slot.
+    private void enableFourSecondSendDrag(Button button) {
+        final Runnable arm = () -> {
+            sendDragArmed = true;
+            if (sendIsFloating) {
+                restoreSendToToolbar();
+                Toast.makeText(MainActivity.this, "دکمهٔ Send به نوار اصلی برگشت", Toast.LENGTH_SHORT).show();
+            } else {
+                attachSendAsFloating();
+                Toast.makeText(MainActivity.this, "دکمهٔ Send شناور شد؛ آن را بکشید", Toast.LENGTH_SHORT).show();
+            }
+            button.setElevation(sendIsFloating ? dp(9) : 0);
+        };
+        button.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    sendDragArmed = false;
+                    sendDragMoved = false;
+                    sendDownRawX = event.getRawX();
+                    sendDownRawY = event.getRawY();
+                    if (sendIsFloating) {
+                        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) button.getLayoutParams();
+                        sendStartLeft = lp.leftMargin;
+                        sendStartTop = lp.topMargin;
+                    } else {
+                        int[] hostLoc = new int[2];
+                        int[] buttonLoc = new int[2];
+                        screenHost.getLocationOnScreen(hostLoc);
+                        button.getLocationOnScreen(buttonLoc);
+                        sendStartLeft = buttonLoc[0] - hostLoc[0];
+                        sendStartTop = buttonLoc[1] - hostLoc[1];
+                    }
+                    button.postDelayed(arm, 4000L);
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if (sendDragArmed) {
+                        float dx = event.getRawX() - sendDownRawX;
+                        float dy = event.getRawY() - sendDownRawY;
+                        if (Math.abs(dx) > dp(3) || Math.abs(dy) > dp(3)) sendDragMoved = true;
+                        if (sendIsFloating) {
+                            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) button.getLayoutParams();
+                            int maxX = Math.max(0, screenHost.getWidth() - button.getWidth());
+                            int maxY = Math.max(0, screenHost.getHeight() - button.getHeight());
+                            lp.gravity = Gravity.TOP | Gravity.LEFT;
+                            lp.leftMargin = Math.max(0, Math.min(maxX, sendStartLeft + (int) dx));
+                            lp.topMargin = Math.max(0, Math.min(maxY, sendStartTop + (int) dy));
+                            button.setLayoutParams(lp);
+                        }
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    button.removeCallbacks(arm);
+                    button.setElevation(sendIsFloating ? dp(5) : 0);
+                    if (event.getActionMasked() == MotionEvent.ACTION_UP && !sendDragArmed) {
+                        button.performClick();
+                    }
+                    sendDragArmed = false;
+                    return true;
+            }
+            return true;
+        });
+    }
+
+    private void attachSendAsFloating() {
+        if (sendButton == null || screenHost == null) return;
+        if (!sendIsFloating) {
+            int[] hostLoc = new int[2];
+            int[] buttonLoc = new int[2];
+            screenHost.getLocationOnScreen(hostLoc);
+            sendButton.getLocationOnScreen(buttonLoc);
+            sendStartLeft = buttonLoc[0] - hostLoc[0];
+            sendStartTop = buttonLoc[1] - hostLoc[1];
+            if (sendButton.getParent() instanceof android.view.ViewGroup) {
+                sendOriginalParent = (android.view.ViewGroup) sendButton.getParent();
+                sendOriginalIndex = sendOriginalParent.indexOfChild(sendButton);
+                sendOriginalLayoutParams = sendButton.getLayoutParams();
+                sendOriginalParent.removeView(sendButton);
+            }
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(64), dp(48), Gravity.TOP | Gravity.LEFT);
+            lp.leftMargin = Math.max(0, sendStartLeft);
+            lp.topMargin = Math.max(0, sendStartTop);
+            sendButton.setAlpha(0.96f);
+            sendButton.setElevation(dp(9));
+            screenHost.addView(sendButton, lp);
+            sendIsFloating = true;
+        }
+    }
+
+    private void restoreSendToToolbar() {
+        if (sendButton == null || !sendIsFloating || sendOriginalParent == null) return;
+        if (sendButton.getParent() instanceof android.view.ViewGroup) {
+            ((android.view.ViewGroup) sendButton.getParent()).removeView(sendButton);
+        }
+        int index = sendOriginalIndex;
+        if (index < 0 || index > sendOriginalParent.getChildCount()) index = sendOriginalParent.getChildCount();
+        android.view.ViewGroup.LayoutParams params = sendOriginalLayoutParams;
+        if (params == null) params = new LinearLayout.LayoutParams(0, dp(59), 1f);
+        sendButton.setAlpha(1f);
+        sendButton.setElevation(0);
+        sendOriginalParent.addView(sendButton, index, params);
+        sendIsFloating = false;
+    }
 
     // Hold a toolbar button for two seconds, then drag horizontally to reorder it.
     // A short tap still triggers the button's original action.
@@ -275,10 +648,10 @@ public class MainActivity extends Activity {
         WebView view = new WebView(this); BrowserTab tab = new BrowserTab(view); tab.lastUrl = url; tabs.add(tab); view.setVisibility(View.GONE);
         stage.addView(view,0,new FrameLayout.LayoutParams(-1,-1));
         LinearLayout chip = new LinearLayout(this); chip.setOrientation(LinearLayout.HORIZONTAL); chip.setGravity(Gravity.CENTER_VERTICAL); chip.setPadding(dp(3),0,dp(2),0); tab.chip = chip;
-        Button select = makeButton("Tab "+tabs.size(),10); select.setTextColor(Color.BLACK); select.setBackgroundTintList(ColorStateList.valueOf(Color.WHITE)); tab.selectButton=select;
+        Button select = makeButton("▣ Tab "+tabs.size(),10); select.setTextColor(Color.BLACK); select.setBackgroundTintList(ColorStateList.valueOf(Color.WHITE)); tab.selectButton=select;
         chip.addView(select,new LinearLayout.LayoutParams(-2,dp(32)));
         enableTabDrag(select, tab);
-        Button close = new Button(this); close.setText("×"); close.setTextSize(15); close.setAllCaps(false); close.setPadding(0,0,0,0); close.setMinWidth(0); close.setMinimumWidth(0); close.setMinHeight(0); close.setMinimumHeight(0); tab.closeButton=close;
+        Button close = new Button(this); close.setText("✕"); close.setTextSize(15); close.setAllCaps(false); close.setPadding(0,0,0,0); close.setMinWidth(0); close.setMinimumWidth(0); close.setMinHeight(0); close.setMinimumHeight(0); tab.closeButton=close;
         chip.addView(close,new LinearLayout.LayoutParams(dp(27),dp(32))); close.setOnClickListener(v -> closeTab(tabs.indexOf(tab)));
         tabStrip.addView(chip,new LinearLayout.LayoutParams(-2,dp(36)));
         configureWeb(view);
@@ -368,15 +741,91 @@ public class MainActivity extends Activity {
 
     private void selectTab(int index) {
         if (index<0||index>=tabs.size()) return; activeTabIndex=index;
-        for (int i=0;i<tabs.size();i++) { BrowserTab t=tabs.get(i); boolean selected=i==index; t.view.setVisibility(selected?View.VISIBLE:View.GONE); int c=selected?Color.WHITE:Color.rgb(218,220,224); t.chip.setBackgroundColor(c); t.selectButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.closeButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.selectButton.setText(t.title); }
+        for (int i=0;i<tabs.size();i++) { BrowserTab t=tabs.get(i); boolean selected=i==index; t.view.setVisibility(selected?View.VISIBLE:View.GONE); int c=selected?Color.WHITE:Color.rgb(218,220,224); t.chip.setBackgroundColor(c); t.selectButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.closeButton.setBackgroundTintList(ColorStateList.valueOf(c)); t.selectButton.setText("▣ "+t.title); }
         web=tabs.get(index).view; String u=web.getUrl(); address.setText(u==null?"":u); updateBookmarkButton(u);
     }
 
     private void closeTab(int index) {
         if (index<0||index>=tabs.size()) return;
-        if (tabs.size()==1) { BrowserTab t=tabs.get(0); t.view.stopLoading(); t.title="خانه"; t.selectButton.setText(t.title); loadHomePage(t.view); selectTab(0); return; }
+        if (tabs.size()==1) { BrowserTab t=tabs.get(0); t.view.stopLoading(); t.title="خانه"; t.selectButton.setText("▣ "+t.title); loadHomePage(t.view); selectTab(0); return; }
         BrowserTab removed=tabs.remove(index); stage.removeView(removed.view); tabStrip.removeView(removed.chip); removed.view.stopLoading(); removed.view.destroy();
         if (index<activeTabIndex) activeTabIndex--; else if (index==activeTabIndex) activeTabIndex=Math.min(index,tabs.size()-1); selectTab(activeTabIndex);
+    }
+
+    private void changePageZoom(int delta) {
+        if (web == null) return;
+        int next = Math.max(40, Math.min(200, zoomPercent + delta));
+        if (next == zoomPercent) { toast(next <= 40 ? "حداقل بزرگ‌نمایی ۴۰٪ است" : "حداکثر بزرگ‌نمایی ۲۰۰٪ است"); return; }
+        float factor = next / (float) zoomPercent;
+        try { web.zoomBy(factor); zoomPercent = next; toast("بزرگ‌نمایی صفحه: " + zoomPercent + "%"); }
+        catch (Exception e) { toast("تغییر بزرگ‌نمایی در این صفحه پشتیبانی نشد"); }
+    }
+
+    private void cycleBrowserWindowSize() {
+        if (Build.VERSION.SDK_INT < 23) { toast("پنجره شناور به اندروید ۶ یا بالاتر نیاز دارد"); return; }
+        if (!Settings.canDrawOverlays(this)) {
+            try {
+                Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName()));
+                startActivity(intent);
+                toast("مجوز نمایش روی برنامه‌های دیگر را فعال کن، سپس دکمه پنجره را دوباره بزن");
+            } catch (Exception e) { toast("تنظیم مجوز پنجره شناور باز نشد"); }
+            return;
+        }
+        if (!floatingWindowActive) {
+            try {
+                if (root.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) root.getParent()).removeView(root);
+                overlayWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+                int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+                overlayWindowParams = new WindowManager.LayoutParams(getScreenWidthPx(), getScreenHeightPx(), type,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        android.graphics.PixelFormat.TRANSLUCENT);
+                overlayWindowParams.gravity = Gravity.CENTER;
+                overlayWindowManager.addView(root, overlayWindowParams);
+                floatingWindowActive = true; windowSizeStep = 0;
+                windowSizeButton.setText("▣");
+                moveTaskToBack(true);
+                toast("پنجره شناور فعال شد؛ لمس برای تغییر اندازه، نگه‌داشتن برای بازگشت به برنامه");
+            } catch (Exception e) {
+                floatingWindowActive = false;
+                try { if (root.getParent() == null) screenHost.addView(root, new FrameLayout.LayoutParams(-1,-1)); } catch (Exception ignored) {}
+                toast("ساخت پنجره شناور ناموفق بود: مجوز نمایش روی برنامه‌های دیگر را بررسی کن");
+            }
+            return;
+        }
+        windowSizeStep = (windowSizeStep + 1) % 4;
+        float[] factors = {1.0f, 0.82f, 0.64f, 0.46f};
+        float factor = factors[windowSizeStep];
+        overlayWindowParams.width = Math.max(dp(220), (int)(getScreenWidthPx() * factor));
+        overlayWindowParams.height = Math.max(dp(180), (int)(getScreenHeightPx() * factor));
+        try {
+            overlayWindowManager.updateViewLayout(root, overlayWindowParams);
+            root.requestLayout();
+            String[] labels = {"اندازه عادی", "پنجره کوچک ۱", "پنجره کوچک ۲", "پنجره کوچک ۳"};
+            toast(labels[windowSizeStep]);
+        } catch (Exception e) { toast("تغییر اندازه پنجره انجام نشد"); }
+    }
+
+    private int getScreenWidthPx() {
+        android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+        if (Build.VERSION.SDK_INT >= 30) getDisplay().getRealMetrics(dm); else ((WindowManager)getSystemService(WINDOW_SERVICE)).getDefaultDisplay().getRealMetrics(dm);
+        return dm.widthPixels;
+    }
+    private int getScreenHeightPx() {
+        android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+        if (Build.VERSION.SDK_INT >= 30) getDisplay().getRealMetrics(dm); else ((WindowManager)getSystemService(WINDOW_SERVICE)).getDefaultDisplay().getRealMetrics(dm);
+        return dm.heightPixels;
+    }
+
+    private void exitFloatingBrowserWindow() {
+        try {
+            if (floatingWindowActive && overlayWindowManager != null && root.getParent() != null) overlayWindowManager.removeView(root);
+        } catch (Exception ignored) {}
+        floatingWindowActive = false; windowSizeStep = 0; overlayWindowParams = null;
+        try {
+            screenHost.removeAllViews();
+            screenHost.addView(root, new FrameLayout.LayoutParams(-1,-1));
+            setContentView(screenHost);
+        } catch (Exception e) { toast("بازگرداندن پنجره به برنامه ناموفق بود"); }
     }
 
     private void configureWeb(WebView target) {
@@ -388,13 +837,31 @@ public class MainActivity extends Activity {
             @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); if (url == null || !url.startsWith("https://mrorgar.home/")) addHistoryEntry(url); }
         });
         target.setWebChromeClient(new WebChromeClient() {
-            @Override public void onReceivedTitle(WebView v,String title) { if (title==null||title.trim().isEmpty()) return; for (BrowserTab t:tabs) if (t.view==target) { t.title=title.length()>20?title.substring(0,20):title; t.selectButton.setText(t.title); break; } }
+            @Override public void onReceivedTitle(WebView v,String title) { if (title==null||title.trim().isEmpty()) return; for (BrowserTab t:tabs) if (t.view==target) { t.title=title.length()>20?title.substring(0,20):title; t.selectButton.setText("▣ "+t.title); break; } }
             @Override public void onProgressChanged(WebView v,int progress) { if (target==web) setTitle("Mrorgar-Q • "+progress+"%"); }
             @Override public boolean onShowFileChooser(WebView v,ValueCallback<Uri[]> callback,FileChooserParams params) {
                 if (uploadCallback!=null) { uploadCallback.onReceiveValue(null); uploadCallback=null; }
                 uploadCallback=callback;
-                try { Intent intent=params.createIntent(); intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true); startActivityForResult(intent,PICK_FILE); }
-                catch (Exception e) { uploadCallback=null; callback.onReceiveValue(null); toast("بازکردن انتخاب‌گر فایل ناموفق بود"); }
+                try {
+                    Intent intent=null;
+                    try { intent=params.createIntent(); } catch (Exception ignored) { }
+                    if (intent==null) {
+                        intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        String[] accept=params.getAcceptTypes();
+                        String type="*/*";
+                        if (accept!=null) {
+                            for (String a:accept) if (a!=null && !a.trim().isEmpty() && !a.equals("*/*")) { type=a; break; }
+                        }
+                        intent.setType(type);
+                    }
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,params.getMode()==FileChooserParams.MODE_OPEN_MULTIPLE);
+                    startActivityForResult(intent,PICK_FILE);
+                } catch (Exception e) {
+                    uploadCallback=null;
+                    callback.onReceiveValue(null);
+                    toast("انتخاب‌گر فایل باز نشد؛ دوباره از دکمهٔ آپلود خود سایت امتحان کن");
+                }
                 return true;
             }
         });
@@ -408,24 +875,24 @@ public class MainActivity extends Activity {
             if (start>=0) { int end=ua.indexOf(' ',start); if (end>start) version=ua.substring(start+chrome.length(),end); }
             ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "+chrome+version+" Safari/537.36";
         }
-        target.getSettings().setUserAgentString(ua); target.getSettings().setUseWideViewPort(true); target.getSettings().setLoadWithOverviewMode(true);
+        target.getSettings().setUserAgentString(ua); target.getSettings().setUseWideViewPort(true); target.getSettings().setLoadWithOverviewMode(true); target.setInitialScale(desktopMode ? 40 : 0);
     }
 
     private void toggleDesktopMode() {
-        desktopMode=!desktopMode; prefs().edit().putBoolean("desktop_mode",desktopMode).apply(); updateDesktopButton();
+        desktopMode=!desktopMode; zoomPercent = desktopMode ? 40 : 100; prefs().edit().putBoolean("desktop_mode",desktopMode).apply(); updateDesktopButton();
         if (web!=null) { String u=web.getUrl(); applyUserAgent(web); if (u!=null&&!u.isEmpty()) web.reload(); }
         toast(desktopMode?"حالت دسکتاپ فعال شد":"حالت موبایل فعال شد");
     }
 
     private void updateDesktopButton() {
         if (top==null) return;
-        for (int i=0;i<top.getChildCount();i++) { View v=top.getChildAt(i); if (v instanceof Button) { Button b=(Button)v; String t=b.getText().toString(); if ("Android Desktop".equals(t)||"Desktop: ON".equals(t)) { b.setText(desktopMode?"Desktop: ON":"Android Desktop"); b.setBackgroundTintList(ColorStateList.valueOf(desktopMode?Color.rgb(46,125,50):Color.rgb(45,46,49))); return; } } }
+        for (int i=0;i<top.getChildCount();i++) { View v=top.getChildAt(i); if (v instanceof Button) { Button b=(Button)v; String t=b.getText().toString(); if (t.contains("Desktop")) { b.setText(desktopMode?"▤\nDesktop: ON":"▤\nDesktop"); b.setBackgroundTintList(ColorStateList.valueOf(desktopMode?Color.rgb(46,125,50):Color.rgb(45,46,49))); return; } } }
     }
 
     private void updateTabInfo(WebView target,String url) {
         if (url==null) return;
         boolean homePage = url.startsWith("https://mrorgar.home/");
-        for (BrowserTab t:tabs) if (t.view==target) { t.lastUrl=url; if (homePage) t.title="خانه"; else if (t.title.equals("New tab")||t.title.startsWith("Tab ")||t.title.equals("خانه")) { String host=Uri.parse(url).getHost(); if (host!=null&&!host.isEmpty()) t.title=host.length()>20?host.substring(0,20):host; } t.selectButton.setText(t.title); break; }
+        for (BrowserTab t:tabs) if (t.view==target) { t.lastUrl=url; if (homePage) t.title="خانه"; else if (t.title.equals("New tab")||t.title.startsWith("Tab ")||t.title.equals("خانه")) { String host=Uri.parse(url).getHost(); if (host!=null&&!host.isEmpty()) t.title=host.length()>20?host.substring(0,20):host; } t.selectButton.setText("▣ "+t.title); break; }
         if (target==web) { address.setText(homePage?"خانه | Mrorgar-Q":url); updateBookmarkButton(homePage?null:url); }
     }
 
@@ -447,7 +914,9 @@ public class MainActivity extends Activity {
             "<p class='sub'>دسترسی سریع به هوش مصنوعی، پیام‌رسان‌ها، تلویزیون و رادیوی آنلاین، دانشنامه و ابزارها</p>" +
             "<form class='search' onsubmit='event.preventDefault();var q=document.getElementById(\"q\").value.trim();if(q)location.href=\"https://www.google.com/search?q=\"+encodeURIComponent(q)'>" +
             "<input id='q' type='search' placeholder='جستجو در وب یا وارد کردن پرسش…' autocomplete='off'><button type='submit'>جستجو</button></form></header>" +
-            "<section class='section'><h2>هوش مصنوعی</h2><div class='grid'>" +
+            "<section class='section'><h2>دسترسی سریع</h2><div class='grid'>" +
+            card("🔎","Google","جست‌وجوی وب","https://www.google.com/") +
+            "</div></section><section class='section'><h2>هوش مصنوعی</h2><div class='grid'>" +
             card("🤖","ChatGPT","هوش مصنوعی OpenAI","https://chatgpt.com/") +
             card("✨","GapGPT","هوش مصنوعی","https://gapgpt.app/") +
             card("🧠","هوشا","هوش مصنوعی فارسی","https://hoosha.com/") +
@@ -487,11 +956,10 @@ public class MainActivity extends Activity {
             card("🗄️","Internet Archive","کتاب، رسانه و آرشیو وب","https://archive.org/") +
             card("🕰️","Wayback Machine","نسخه‌های قدیمی سایت‌ها","https://web.archive.org/") +
             card("🐙","GitHub","مخزن کد و پروژه‌ها","https://github.com/") +
-            card("🔎","Google","جست‌وجوی وب","https://www.google.com/") +
             card("🦊","MDN Web Docs","راهنمای توسعه وب","https://developer.mozilla.org/") +
             "</div></section><p class='footer'>برای باز کردن هر سرویس، کارت آن را لمس کنید. دسترسی به بعضی سایت‌ها ممکن است به شبکه یا حساب کاربری وابسته باشد.</p></main></body></html>";
         target.loadDataWithBaseURL("https://mrorgar.home/", html, "text/html", "UTF-8", null);
-        for (BrowserTab t : tabs) if (t.view == target) { t.title = "خانه"; t.selectButton.setText(t.title); t.lastUrl = "https://mrorgar.home/"; break; }
+        for (BrowserTab t : tabs) if (t.view == target) { t.title = "خانه"; t.selectButton.setText("▣ "+t.title); t.lastUrl = "https://mrorgar.home/"; break; }
         if (target == web && address != null) address.setText("خانه | Mrorgar-Q");
     }
 
@@ -535,15 +1003,30 @@ public class MainActivity extends Activity {
         });
     }
 
-    // Opens the upload input belonging to the current website, so onShowFileChooser can return the file to that site.
+    // Opens a site's real file input. Searches ordinary DOM, open shadow roots, and same-origin frames.
     private void pickAnyFile() {
-        if (web==null) return;
-        String js="(function(){try{var a=Array.from(document.querySelectorAll('input[type=file]'));if(!a.length)return 'no_input';var e=a.find(function(x){return x.offsetWidth||x.offsetHeight||x.getClientRects().length;})||a[0];e.click();return 'clicked';}catch(e){return 'error';}})()";
-        web.evaluateJavascript(js,result -> {
-            if (result==null||result.contains("no_input")) toast("این صفحه ورودی آپلود فایل ندارد؛ ابتدا فرم آپلود سایت را باز کن");
-            else if (result.contains("error")) toast("بازکردن فرم آپلود سایت ناموفق بود");
-            else if (result.contains("clicked")) toast("درخواست انتخاب فایل به فرم سایت داده شد");
-            // The actual file picker is launched by WebChromeClient.onShowFileChooser.
+        final WebView current=web;
+        if (current==null) { toast("ابتدا یک صفحه را باز کن"); return; }
+        final String js = "(function(){try{"+
+            "var seen=[],roots=[];"+
+            "function addRoot(r){if(!r||seen.indexOf(r)>=0)return;seen.push(r);roots.push(r);var all=[];try{all=r.querySelectorAll('*')}catch(e){};"+
+            "for(var i=0;i<all.length;i++){try{if(all[i].shadowRoot)addRoot(all[i].shadowRoot);if(all[i].tagName==='IFRAME'&&all[i].contentDocument)addRoot(all[i].contentDocument)}catch(e){}}}"+
+            "addRoot(document);"+
+            "function all(sel){var out=[];for(var r=0;r<roots.length;r++){try{var a=roots[r].querySelectorAll(sel);for(var j=0;j<a.length;j++)out.push(a[j])}catch(e){}}return out}"+
+            "var inputs=all('input[type=file]');for(var n=0;n<inputs.length;n++){var x=inputs[n];if(!x.disabled){try{x.click();return 'clicked_input'}catch(e){}}}"+
+            "var labels=all('label[for]');for(var l=0;l<labels.length;l++){var tx=(labels[l].innerText||labels[l].textContent||'').toLowerCase();if(/file|upload|attach|browse|choose|پیوست|بارگذار|انتخاب فایل|افزودن فایل/.test(tx)){try{labels[l].click();return 'clicked_trigger'}catch(e){}}}"+
+            "var els=all('button,[role=button],input[type=button],input[type=submit],[title],[aria-label]');for(var k=0;k<els.length;k++){var e=els[k],t=((e.innerText||e.value||'')+' '+(e.title||'')+' '+(e.getAttribute('aria-label')||'')).toLowerCase();if(/upload|attach|choose file|select file|browse|add file|پیوست|بارگذاری|انتخاب فایل|افزودن فایل/.test(t)&&!e.disabled){try{e.click();return 'clicked_trigger'}catch(err){}}}"+
+            "return 'no_input';}catch(e){return 'error';}})()";
+        current.evaluateJavascript(js,result -> {
+            if (current!=web) { toast("زبانه عوض شده است؛ دوباره دکمهٔ File را بزن"); return; }
+            if (result==null || result.contains("no_input"))
+                toast("در این صفحه فرم انتخاب فایل پیدا نشد؛ ابتدا دکمهٔ پیوست/آپلود خود سایت را باز کن");
+            else if (result.contains("error"))
+                toast("بازکردن فرم فایل ناموفق بود؛ از دکمهٔ آپلود داخل خود سایت امتحان کن");
+            else if (result.contains("clicked_trigger"))
+                toast("دکمهٔ آپلود سایت فعال شد؛ اگر انتخاب‌گر باز نشد، دکمهٔ فایل داخل خود سایت را لمس کن");
+            else if (result.contains("clicked_input"))
+                toast("درخواست انتخاب فایل به سایت داده شد");
         });
     }
 
