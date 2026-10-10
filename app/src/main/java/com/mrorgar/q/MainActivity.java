@@ -187,7 +187,7 @@ public class MainActivity extends Activity {
         root.addView(tabRow,new LinearLayout.LayoutParams(-1,dp(36)));
         stage = new FrameLayout(this); root.addView(stage,new LinearLayout.LayoutParams(-1,0,1));
         restoreButton = new Button(this); restoreButton.setText("↗"); restoreButton.setTextSize(18); restoreButton.setAllCaps(false); restoreButton.setVisibility(View.GONE); restoreButton.setTextColor(Color.WHITE);
-        restoreButton.setBackgroundTintList(ColorStateList.valueOf(Color.TRANSPARENT)); restoreButton.setBackgroundColor(Color.TRANSPARENT); restoreButton.setAlpha(0.48f); restoreButton.setElevation(dp(5)); restoreButton.setPadding(0,0,0,0);
+        restoreButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(137,171,192))); restoreButton.setBackgroundColor(Color.rgb(137,171,192)); restoreButton.setAlpha(0.92f); restoreButton.setElevation(dp(5)); restoreButton.setPadding(0,0,0,0);
         FrameLayout.LayoutParams restoreLp = new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.LEFT); restoreLp.leftMargin=dp(8); restoreLp.topMargin=dp(90);
         stage.addView(restoreButton,restoreLp);
         restoreButton.setOnTouchListener((v,event)->{
