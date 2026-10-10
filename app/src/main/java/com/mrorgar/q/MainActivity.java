@@ -38,11 +38,11 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONTokener;
+import org.json.JSONObject;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -55,6 +55,8 @@ public class MainActivity extends Activity {
     private LinearLayout root, top, tabStrip, tabRow, addressRow;
     private FrameLayout stage;
     private Button restoreButton;
+    private Button copyMwButton;
+    private boolean copyMwArmed = false;
     private ValueCallback<Uri[]> uploadCallback;
     private DownloadManager downloadManager;
     private static final int PICK_FILE = 601;
@@ -93,11 +95,8 @@ public class MainActivity extends Activity {
             if (savedUrl != null && !savedUrl.trim().isEmpty()) initialUrl = savedUrl;
             desktopMode = state.getBoolean("desktop_mode", false);
         } else desktopMode = prefs().getBoolean("desktop_mode", false);
-        final String urlToOpen = initialUrl;
-        restoreProxySettings(() -> {
-            createTab(urlToOpen);
-            updateDesktopButton();
-        });
+        createTab(initialUrl);
+        updateDesktopButton();
     }
 
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -130,12 +129,24 @@ public class MainActivity extends Activity {
         root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(Color.WHITE);
         top = new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL); top.setBackgroundColor(Color.rgb(32,33,36));
         String[] names = {"Back","Forward","Send","File","Copy MW","IP Set","Save","Android Desktop","F Screen","Setup"};
+        // Same single row, with buttons about 5 mm taller and distinct colors.
+        int[][] buttonColors = {
+            {69,90,100}, {69,90,100}, {46,125,50}, {21,101,192},
+            {123,31,162}, {230,126,34}, {0,121,107}, {45,46,49},
+            {63,81,181}, {96,125,139}
+        };
+        int colorIndex = 0;
         for (String name : names) {
-            Button b = makeButton(name,8f);
-            top.addView(b,new LinearLayout.LayoutParams(0,dp(38),1));
+            Button b = makeButton(name,9f);
+            b.setPadding(dp(1),0,dp(1),0);
+            b.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(buttonColors[colorIndex][0],buttonColors[colorIndex][1],buttonColors[colorIndex][2])));
+            float weight = Math.max(0.72f, name.length() / 5.0f);
+            top.addView(b,new LinearLayout.LayoutParams(0,dp(59),weight));
+            if ("Copy MW".equals(name)) copyMwButton = b;
             b.setOnClickListener(v -> { if ("Android Desktop".equals(name)) toggleDesktopMode(); else if ("Save".equals(name)) multiDownloadDialog(); else doAction(name); });
+            colorIndex++;
         }
-        root.addView(top,new LinearLayout.LayoutParams(-1,dp(38)));
+        root.addView(top,new LinearLayout.LayoutParams(-1,dp(59)));
         addressRow = new LinearLayout(this); addressRow.setOrientation(LinearLayout.HORIZONTAL); addressRow.setGravity(Gravity.CENTER_VERTICAL); addressRow.setPadding(dp(3),0,dp(3),0);
         address = new EditText(this); address.setSingleLine(true); address.setTextSize(14); address.setHint("Website or search words"); address.setPadding(dp(10),0,dp(8),0); address.setImeOptions(EditorInfo.IME_ACTION_GO); address.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);
         addressRow.addView(address,new LinearLayout.LayoutParams(0,dp(42),1));
@@ -166,7 +177,14 @@ public class MainActivity extends Activity {
         Button close = new Button(this); close.setText("×"); close.setTextSize(15); close.setAllCaps(false); close.setPadding(0,0,0,0); close.setMinWidth(0); close.setMinimumWidth(0); close.setMinHeight(0); close.setMinimumHeight(0); tab.closeButton=close;
         chip.addView(close,new LinearLayout.LayoutParams(dp(27),dp(32))); close.setOnClickListener(v -> closeTab(tabs.indexOf(tab)));
         tabStrip.addView(chip,new LinearLayout.LayoutParams(-2,dp(36)));
-        configureWeb(view); selectTab(tabs.size()-1); view.loadUrl(url);
+        configureWeb(view);
+        view.setOnTouchListener((v, event) -> {
+            if (copyMwArmed && event.getAction() == android.view.MotionEvent.ACTION_UP) {
+                v.postDelayed(() -> handleCopyMWSelection(), 120);
+            }
+            return false;
+        });
+        selectTab(tabs.size()-1); view.loadUrl(url);
     }
 
     private void selectTab(int index) {
@@ -183,11 +201,7 @@ public class MainActivity extends Activity {
     }
 
     private void configureWeb(WebView target) {
-        WebSettings s=target.getSettings();
-        s.setJavaScriptEnabled(prefs().getBoolean("javascript_enabled", true));
-        s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false);
-        s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled", true));
-        s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
+        WebSettings s=target.getSettings(); s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false); s.setLoadsImagesAutomatically(true); s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
         CookieManager cm=CookieManager.getInstance(); cm.setAcceptCookie(true); if (Build.VERSION.SDK_INT>=21) cm.setAcceptThirdPartyCookies(target,true);
         target.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { String scheme=r.getUrl().getScheme(); return scheme!=null&&!scheme.equalsIgnoreCase("http")&&!scheme.equalsIgnoreCase("https"); }
@@ -245,7 +259,7 @@ public class MainActivity extends Activity {
 
     private void doAction(String action) {
         if (web==null) return;
-        switch(action) { case "Back": if(web.canGoBack())web.goBack(); break; case "Forward":if(web.canGoForward())web.goForward();break; case "Send":sendContent();break; case "File":pickAnyFile();break; case "Copy MW":copyPage();break; case "IP Set":ipSettings();break; case "Save":savePage();break; case "F Screen":setFullscreen();break; case "Setup":setupPanel();break; }
+        switch(action) { case "Back": if(web.canGoBack())web.goBack(); break; case "Forward":if(web.canGoForward())web.goForward();break; case "Send":sendContent();break; case "File":pickAnyFile();break; case "Copy MW":armCopyMW();break; case "IP Set":ipSettings();break; case "Save":savePage();break; case "F Screen":setFullscreen();break; case "Setup":setupPanel();break; }
     }
 
     // Send uses the current page's active form or send button. It never opens Android's external Share sheet.
@@ -345,65 +359,75 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this).setTitle("ابزار دانلود و ذخیره").setItems(choices,(d,w)->{
             if(w==0)showDownloadManager();
             else if(w==1){EditText input=field("آدرس مستقیم فایل","https://example.com/file.zip");new AlertDialog.Builder(this).setTitle("دانلود فایل از آدرس").setView(input).setNegativeButton("لغو",null).setPositiveButton("دانلود",(dd,ww)->{String u=input.getText().toString().trim();if(!u.isEmpty())enqueueDownload(u,web==null?WebSettings.getDefaultUserAgent(this):web.getSettings().getUserAgentString(),null,null);}).show();}
-            else if(w==2)savePage(); else copyPage();
+            else if(w==2)savePage(); else copyCurrentUrl();
         }).setNegativeButton("بستن",null).show();
     }
 
-    private void copyPage() {
-        if(web==null)return; String url=web.getUrl(); if(url==null||url.isEmpty()){toast("صفحه‌ای باز نیست");return;}
-        web.evaluateJavascript("(function(){return document.body?document.body.innerText:'';})()",result->{
-            try { Object p=new JSONTokener(result).nextValue(); String text=p==null?"":p.toString(); if(text.trim().isEmpty())text=url; android.content.ClipboardManager c=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE); if(c!=null){c.setPrimaryClip(ClipData.newPlainText("Mrorgar-Q",text));toast("محتوای متنی صفحه کپی شد");} }
-            catch(Exception e){android.content.ClipboardManager c=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);if(c!=null)c.setPrimaryClip(ClipData.newPlainText("Mrorgar-Q",url));toast("آدرس صفحه کپی شد");}
+    // One-shot Copy MW selection mode: wait quietly for the next tap in the page.
+    private void armCopyMW() {
+        if (web == null) { toast("صفحه‌ای باز نیست"); return; }
+        if (copyMwArmed) {
+            copyMwArmed = false; resetCopyMwButton();
+            if (web != null) web.evaluateJavascript("(function(){if(window.__mrorgarCopyMWHandler)document.removeEventListener('click',window.__mrorgarCopyMWHandler,true);window.__mrorgarCopyMWHandler=null;window.__mrorgarCopyMWResult='';return true;})()", null);
+            toast("حالت Copy MW لغو شد"); return;
+        }
+        copyMwArmed = true;
+        if (copyMwButton != null) { copyMwButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(255,193,7))); copyMwButton.setTextColor(Color.BLACK); }
+        String js = "(function(){try{"+
+            "if(window.__mrorgarCopyMWHandler)document.removeEventListener('click',window.__mrorgarCopyMWHandler,true);"+
+            "window.__mrorgarCopyMWHandler=function(ev){try{"+
+            "var t=ev.target;if(!t||t===document.documentElement||t===document.body)t=(t&&t.parentElement)||document.body;"+
+            "var box=t.closest?t.closest('[role=dialog],dialog,[aria-modal=true],[class*=modal i],[class*=popup i],[class*=popover i]'):null;"+
+            "if(!box&&t.closest)box=t.closest('article,section,main,form,[class*=menu i],li');"+
+            "if(!box&&t.closest)box=t.closest('div');"+
+            "if(!box||box===document.body||box===document.documentElement)box=t.parentElement||t;"+
+            "ev.preventDefault();ev.stopPropagation();if(ev.stopImmediatePropagation)ev.stopImmediatePropagation();"+
+            "document.removeEventListener('click',window.__mrorgarCopyMWHandler,true);window.__mrorgarCopyMWHandler=null;"+
+            "window.__mrorgarCopyMWResult=JSON.stringify({html:box.outerHTML||'',text:(box.innerText||box.textContent||'').trim()});return true;"+
+            "}catch(e){window.__mrorgarCopyMWResult=JSON.stringify({html:'',text:''});return true;}};"+
+            "window.__mrorgarCopyMWResult='';document.addEventListener('click',window.__mrorgarCopyMWHandler,true);return 'armed';"+
+            "}catch(e){return 'error';}})()";
+        web.evaluateJavascript(js, result -> {
+            if (result == null || result.contains("error")) { copyMwArmed=false; resetCopyMwButton(); toast("فعال‌کردن Copy MW ناموفق بود"); }
+        });
+    }
+
+    private void resetCopyMwButton() {
+        if (copyMwButton != null) { copyMwButton.setBackgroundTintList(ColorStateList.valueOf(Color.rgb(123,31,162))); copyMwButton.setTextColor(Color.WHITE); }
+    }
+
+    private void copyCurrentUrl() {
+        if (web == null || web.getUrl() == null) { toast("صفحه‌ای باز نیست"); return; }
+        android.content.ClipboardManager c=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+        if(c!=null){c.setPrimaryClip(ClipData.newPlainText("Mrorgar-Q",web.getUrl()));toast("آدرس صفحه کپی شد");}
+    }
+
+    private void handleCopyMWSelection() {
+        if (web == null || !copyMwArmed) return;
+        web.evaluateJavascript("(function(){var r=window.__mrorgarCopyMWResult||'';window.__mrorgarCopyMWResult='';return r;})()", result -> {
+            copyMwArmed=false; resetCopyMwButton();
+            try {
+                Object decoded = new JSONTokener(result == null ? "null" : result).nextValue();
+                if (!(decoded instanceof String)) throw new Exception("No selection data");
+                JSONObject data = new JSONObject((String)decoded);
+                String html=data.optString("html",""); String txt=data.optString("text","").trim();
+                if(html.isEmpty()&&txt.isEmpty()){toast("این بخش قابل کپی نبود");return;}
+                android.content.ClipboardManager c=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                if(c!=null){c.setPrimaryClip(ClipData.newHtmlText("Mrorgar-Q Copy MW",txt,html));toast("بخش انتخاب‌شده کپی شد");}
+            } catch(Exception e) { toast("کپی این بخش انجام نشد"); }
         });
     }
 
     private EditText field(String hint,String value) { EditText e=new EditText(this);e.setSingleLine(true);e.setHint(hint);e.setTextSize(15);e.setPadding(dp(12),dp(8),dp(12),dp(8));if(value!=null){e.setText(value);e.setSelection(e.getText().length());}return e; }
 
     private void setupPanel() {
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(20), dp(10), dp(20), dp(4));
-
-        Switch javaSwitch = new Switch(this);
-        javaSwitch.setText("JavaScript  •  اجرای کدهای سایت");
-        javaSwitch.setTextSize(15);
-        javaSwitch.setPadding(0, dp(10), 0, dp(10));
-        javaSwitch.setChecked(prefs().getBoolean("javascript_enabled", true));
-        panel.addView(javaSwitch, new LinearLayout.LayoutParams(-1, -2));
-
-        Switch photoSwitch = new Switch(this);
-        photoSwitch.setText("Photo  •  بارگذاری تصاویر");
-        photoSwitch.setTextSize(15);
-        photoSwitch.setPadding(0, dp(10), 0, dp(10));
-        photoSwitch.setChecked(prefs().getBoolean("photos_enabled", true));
-        panel.addView(photoSwitch, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView note = new TextView(this);
-        note.setText("تنظیمات پس از ذخیره برای همهٔ زبانه‌ها اعمال می‌شوند و با بستن مرورگر باقی می‌مانند. خاموش‌کردن JavaScript ممکن است بعضی سایت‌ها را از کار بیندازد.");
-        note.setTextSize(12);
-        note.setTextColor(Color.DKGRAY);
-        note.setPadding(0, dp(10), 0, dp(4));
-        panel.addView(note, new LinearLayout.LayoutParams(-1, -2));
-
+        String message = "تنظیمات تکمیلی مرورگر\n\n"+
+                "دکمه‌های Back، Forward، Send، File، Copy MW، IP Set، Save، Android Desktop و F Screen روی نوار اصلی باقی می‌مانند.\n\n"+
+                "این بخش برای گزینه‌های کم‌استفادهٔ آینده در نظر گرفته شده است؛ فعلاً گزینهٔ تنظیمیِ دیگری به آن اضافه نشده تا دکمهٔ غیرعملیاتی نمایش داده نشود.";
         new AlertDialog.Builder(this)
                 .setTitle("Setup")
-                .setView(panel)
-                .setNegativeButton("لغو", null)
-                .setPositiveButton("ذخیره و اعمال", (dialog, which) -> {
-                    boolean jsEnabled = javaSwitch.isChecked();
-                    boolean photosEnabled = photoSwitch.isChecked();
-                    prefs().edit()
-                            .putBoolean("javascript_enabled", jsEnabled)
-                            .putBoolean("photos_enabled", photosEnabled)
-                            .apply();
-                    for (BrowserTab tab : tabs) {
-                        WebSettings settings = tab.view.getSettings();
-                        settings.setJavaScriptEnabled(jsEnabled);
-                        settings.setLoadsImagesAutomatically(photosEnabled);
-                    }
-                    if (web != null && web.getUrl() != null && !web.getUrl().isEmpty()) web.reload();
-                    toast("تنظیمات JavaScript و تصاویر ذخیره و اعمال شد");
-                })
+                .setMessage(message)
+                .setPositiveButton("باشه", null)
                 .show();
     }
 
@@ -415,28 +439,6 @@ public class MainActivity extends Activity {
     private void applyProxyDialog() {
         EditText host=field("آدرس یا IP پروکسی",prefs().getString("proxy_host",""));EditText port=field("پورت پروکسی",prefs().getString("proxy_port",""));port.setInputType(InputType.TYPE_CLASS_NUMBER);LinearLayout p=new LinearLayout(this);p.setOrientation(LinearLayout.VERTICAL);p.setPadding(dp(20),dp(8),dp(20),dp(4));p.addView(host);p.addView(port);
         new AlertDialog.Builder(this).setTitle("تنظیم Proxy").setView(p).setNeutralButton("خاموش‌کردن",(d,w)->disableProxy()).setNegativeButton("لغو",null).setPositiveButton("ذخیره و اعمال",(d,w)->applyProxy(host.getText().toString().trim(),port.getText().toString().trim())).show();
-    }
-
-    private void restoreProxySettings(Runnable onReady) {
-        boolean enabled = prefs().getBoolean("proxy_enabled", false);
-        String host = prefs().getString("proxy_host", "").trim();
-        String port = prefs().getString("proxy_port", "").trim();
-        if (!enabled || host.isEmpty() || port.isEmpty() || Build.VERSION.SDK_INT < 28) {
-            onReady.run();
-            return;
-        }
-        try {
-            int p = Integer.parseInt(port);
-            if (p < 1 || p > 65535) {
-                onReady.run();
-                return;
-            }
-            ProxyConfig config = new ProxyConfig.Builder().addProxyRule(host + ":" + p).build();
-            ProxyController.getInstance().setProxyOverride(config, Runnable::run, () -> runOnUiThread(onReady));
-        } catch (Exception ignored) {
-            // Keep the app usable if saved proxy settings are invalid or unsupported.
-            onReady.run();
-        }
     }
 
     private void applyProxy(String host,String port) {
