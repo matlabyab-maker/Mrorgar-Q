@@ -127,6 +127,9 @@ public class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        // Keep the WebView visible and correctly resized when the Android IME opens.
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         getWindow().setStatusBarColor(Color.rgb(32,33,36));
         getWindow().setNavigationBarColor(Color.BLACK);
         downloadManager = (DownloadManager)getSystemService(DOWNLOAD_SERVICE);
@@ -779,6 +782,8 @@ public class MainActivity extends Activity {
                 overlayWindowParams = new WindowManager.LayoutParams(getScreenWidthPx(), getScreenHeightPx(), type,
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                         android.graphics.PixelFormat.TRANSLUCENT);
+                // Overlay must remain focusable so login, password and one-time-code fields can open the keyboard.
+                overlayWindowParams.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
                 overlayWindowParams.gravity = Gravity.CENTER;
                 overlayWindowManager.addView(root, overlayWindowParams);
                 floatingWindowActive = true; windowSizeStep = 0;
@@ -829,7 +834,30 @@ public class MainActivity extends Activity {
     }
 
     private void configureWeb(WebView target) {
-        WebSettings s=target.getSettings(); s.setJavaScriptEnabled(prefs().getBoolean("javascript_enabled",true)); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true); s.setLoadWithOverviewMode(true); s.setUseWideViewPort(true); s.setSupportZoom(true); s.setBuiltInZoomControls(true); s.setDisplayZoomControls(false); s.setSupportMultipleWindows(false); s.setJavaScriptCanOpenWindowsAutomatically(false); s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled",true)); s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setMediaPlaybackRequiresUserGesture(false); applyUserAgent(target);
+        WebSettings s=target.getSettings();
+        s.setJavaScriptEnabled(prefs().getBoolean("javascript_enabled",true));
+        s.setDomStorageEnabled(true);
+        s.setDatabaseEnabled(true);
+        s.setLoadWithOverviewMode(true);
+        s.setUseWideViewPort(true);
+        s.setSupportZoom(true);
+        s.setBuiltInZoomControls(true);
+        s.setDisplayZoomControls(false);
+        s.setSupportMultipleWindows(false);
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
+        s.setLoadsImagesAutomatically(prefs().getBoolean("photos_enabled",true));
+        s.setAllowFileAccess(true);
+        s.setAllowContentAccess(true);
+        s.setMediaPlaybackRequiresUserGesture(false);
+        // Keep website input fields at their normal text size; page zoom remains independent.
+        s.setTextZoom(100);
+        s.setDefaultTextEncodingName("UTF-8");
+        target.setFocusable(true);
+        target.setFocusableInTouchMode(true);
+        target.setDescendantFocusability(android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        target.setSaveEnabled(true);
+        if (Build.VERSION.SDK_INT >= 26) target.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_YES);
+        applyUserAgent(target);
         CookieManager cm=CookieManager.getInstance(); cm.setAcceptCookie(true); if (Build.VERSION.SDK_INT>=21) cm.setAcceptThirdPartyCookies(target,true);
         target.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { String scheme=r.getUrl().getScheme(); return scheme!=null&&!scheme.equalsIgnoreCase("http")&&!scheme.equalsIgnoreCase("https"); }
@@ -837,6 +865,12 @@ public class MainActivity extends Activity {
             @Override public void onPageFinished(WebView v,String url) { updateTabInfo(target,url); if (url == null || !url.startsWith("https://mrorgar.home/")) addHistoryEntry(url); }
         });
         target.setWebChromeClient(new WebChromeClient() {
+            @Override public void onRequestFocus(WebView v) {
+                // Some login/OTP pages ask the host WebView to take focus before showing the IME.
+                v.setFocusable(true);
+                v.setFocusableInTouchMode(true);
+                v.requestFocus(View.FOCUS_DOWN);
+            }
             @Override public void onReceivedTitle(WebView v,String title) { if (title==null||title.trim().isEmpty()) return; for (BrowserTab t:tabs) if (t.view==target) { t.title=title.length()>20?title.substring(0,20):title; t.selectButton.setText("▣ "+t.title); break; } }
             @Override public void onProgressChanged(WebView v,int progress) { if (target==web) setTitle("Mrorgar-Q • "+progress+"%"); }
             @Override public boolean onShowFileChooser(WebView v,ValueCallback<Uri[]> callback,FileChooserParams params) {
